@@ -1,0 +1,55 @@
+# Canonical skill manifest — the ONLY source for identity and requirements.
+# tools/build.py renders Hermes and OpenClaw frontmatter from this file.
+# Unknown keys are a build error.
+
+schema_version: 1
+
+skill:
+  name: cranston
+  description: Self-healing home monitor that fixes, asks first, or digests
+  license: MIT-0
+  compatibility: Requires python3 3.9+, bash, curl, and system cron on an always-on LAN box
+  author: jetsharklambo
+  version: 0.2.0
+  homepage: https://github.com/jetsharklambo/cranston-skill
+
+platforms:
+  - linux
+  - macos
+
+dependencies:
+  bins:
+    - name: python3
+      mode: hard
+    - name: bash
+      mode: hard
+    - name: curl
+      mode: hard
+    - name: dig
+      mode: soft
+      required_for: the check-dns.sh template
+    - name: openssl
+      mode: soft
+      required_for: the check-cert-expiry.sh template
+  env:
+    - name: TG_BOT_TOKEN
+      mode: soft
+      prompt: Telegram bot token (from @BotFather)
+      help: https://core.telegram.org/bots/tutorial
+      required_for: the example Telegram alert sink only; any alert sink command works
+    - name: TG_CHAT_ID
+      mode: soft
+      prompt: Telegram chat id for alerts
+      required_for: the example Telegram alert sink only; any alert sink command works
+
+hermes:
+  tags:
+    - home-automation
+    - monitoring
+    - self-healing
+  requires_toolsets:
+    - terminal
+
+openclaw:
+  user_invocable: true
+  disable_model_invocation: false

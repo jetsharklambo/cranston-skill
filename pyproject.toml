@@ -1,0 +1,10 @@
+[project]
+name = "cranston-skill"
+version = "0.2.0"
+description = "Authoring repo for the Cranston self-healing home agent skill (dual Hermes/OpenClaw distribution)"
+requires-python = ">=3.9"
+license = "MIT-0"
+
+# No runtime dependencies by design: the engine and the build tooling are
+# stdlib-only so the always-on box needs nothing installed.
+dependencies = []

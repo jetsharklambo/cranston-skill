@@ -31,24 +31,32 @@ deployed *to* it.
 
 ## Layout
 
+**One canonical source, two generated installation views.** Everything under
+`authoring/` is hand-edited; `tools/build.py` materializes the root skill
+artifact (OpenClaw installs from the repo root) and `skills/cranston/` (Hermes
+taps discover skills there). CI fails if the generated views drift from the
+source, so the two platforms can never silently diverge.
+
 ```
-engine/
-  selfheal.py        the orchestrator: one cycle per run, from OS cron
-  approve-heal.py    executes a human-approved pending fix, then verifies
-  lib/check.sh       emit/param helpers for check templates
-  lib/remediation.sh audit -> cap -> act -> verify -> result skeleton
-bin/
-  send-alert.sh      default alert sink: lock + merge + dedupe into a pending
-                     file the adapter's delivery cron sends
-  flush-digest.sh    cron fallback for the daily digest (the primary renderer
-                     usually rides the agent, which can die silently)
-checks/templates/    9 parameterized check archetypes (see below)
-remediations/templates/  skeleton + 3 archetypes
-config/              schema v2 (documented) + a minimal starter config
-examples/cranston/   the reference deployment translated to v2 - worked
-                     example only, never deployed
-tests/               engine suite (43 assertions) + template smoke tests (36)
-methodology/         pointer to the design blueprint (phase 3 fills this in)
+authoring/              THE hand-edited source
+  manifest.yaml         identity + dependency manifest (renders both frontmatters)
+  SKILL.body.md         shared skill instructions ({{SKILL_DIR}} token, per-target render)
+  adapters/             one short preamble per platform
+  scripts/
+    engine/selfheal.py    the orchestrator: one cycle per run, from OS cron
+    engine/approve-heal.py executes a human-approved pending fix, then verifies
+    engine/lib/           emit/param + audit->cap->act->verify skeletons
+    bin/                  default queueing alert sink + daily-digest flusher
+    checks/templates/     9 parameterized check archetypes (see below)
+    remediations/templates/ skeleton + 3 archetypes
+  references/           schema v2 docs, hardware guide, worked example, methodology
+  assets/               minimal starter config
+SKILL.md + scripts/ + references/ + assets/   GENERATED (OpenClaw root artifact)
+skills/cranston/                              GENERATED (Hermes tap artifact)
+tools/                  build.py + check_drift.py + validate_links.py
+tests/                  engine suite (49 assertions) + template smoke tests (36)
+                        + build tooling tests (21)
+docs/                   the dual-platform repository spec + design notes
 ```
 
 ## Design, in one paragraph each
@@ -163,15 +171,22 @@ machine doing the watching.
 ### 1. Get the code and write your config
 
 ```bash
-git clone git@github.com:jetsharklambo/cranston-skill.git
-cd cranston-core
-cp config/services.example.json services.json
+git clone https://github.com/jetsharklambo/cranston-skill.git
+mkdir -p /opt/cranston
+cp -R cranston-skill/scripts/. /opt/cranston/
+cp cranston-skill/assets/services.example.json /opt/cranston/services.json
+cd /opt/cranston
 ```
+
+(The deployment is a *copy* of the generated `scripts/` tree — the install
+root is the directory that contains `engine/`. Any writable always-on
+location works; `/opt/cranston` is just the example.)
 
 Edit `services.json`: one service block per thing you care about, every
 target in `params`. Start small — three services you actually feel when they
-break beat twelve you don't. Field-by-field docs: `config/services.schema.md`.
-A full 12-service real-world shape: `examples/cranston/services.json`.
+break beat twelve you don't. Field-by-field docs:
+`references/services.schema.md`. A full 12-service real-world shape:
+`references/example-cranston/services.json`.
 
 ### 2. Wire the alert path (the part that makes it yours)
 
@@ -210,8 +225,8 @@ fix it, run cycles until the held ✅ releases (~10 min of health).
 ### 4. Put it on cron
 
 ```cron
-*/2 * * * * flock -n /tmp/cranston-core.cronlock python3 /opt/cranston-core/engine/selfheal.py >> /var/log/cranston-core.log 2>&1
-25 5 * * *  SELFHEAL_DIGEST_FILE=/opt/cranston-core/state/digest.jsonl SELFHEAL_NOTIFY_CMD=/opt/cranston-core/bin/my-sink.sh /opt/cranston-core/bin/flush-digest.sh
+*/2 * * * * flock -n /tmp/cranston.cronlock python3 /opt/cranston/engine/selfheal.py >> /var/log/cranston.log 2>&1
+25 5 * * *  SELFHEAL_DIGEST_FILE=/opt/cranston/state/digest.jsonl SELFHEAL_NOTIFY_CMD=/opt/cranston/bin/my-sink.sh /opt/cranston/bin/flush-digest.sh
 ```
 
 System cron, never an agent's scheduler — the whole point is that monitoring
@@ -240,18 +255,55 @@ path (power-on behavior, retained state), set the `consent` field, and cap
 it. The reference home's rules of thumb are in the blueprint's safety
 section — every one of them was paid for.
 
+## Installing as an agent skill
+
+Both packages are generated from one source (`authoring/`) and committed, so
+installs need no build step. The skill teaches an agent to install, operate,
+and approve fixes for the engine — the engine itself still runs from system
+cron, never from the agent.
+
+### OpenClaw
+
+```bash
+openclaw skills install git:jetsharklambo/cranston-skill@main
+```
+
+OpenClaw installs the repository root (`SKILL.md` + `scripts/` +
+`references/` + `assets/`). Pin a tag instead of `@main` when
+reproducibility matters; Git-sourced installs are refreshed by reinstalling.
+
+### Hermes
+
+```bash
+hermes skills tap add jetsharklambo/cranston-skill
+hermes skills install jetsharklambo/cranston-skill/cranston
+```
+
+Hermes discovers the tap artifact at `skills/cranston/`.
+
+### Dependencies and secrets
+
+Hard: `python3` (3.9+), `bash`, `curl`. Soft: `dig` (DNS template),
+`openssl` (cert template), and `TG_BOT_TOKEN`/`TG_CHAT_ID` — needed only by
+the example Telegram sink; any `alert_sink` command of your own works
+without them. Never put secret values in `services.json`; keep them in a
+mode-600 file the cron line sources.
+
 ## Running the tests
 
 ```
-python3 tests/test_engine.py     # 43 assertions, isolated temp install
+python3 tests/test_engine.py     # 49 assertions, isolated temp install
 bash tests/test_templates.sh     # 36 assertions, offline (local stub servers)
+python3 tests/test_build.py      # 21 assertions, build/drift/link tooling
 ```
 
 ## Status / roadmap
 
 - Phase 1 — design blueprint: done (separate document; published as part of phase 4)
 - **Phase 2 — this repo: engine v2, template library, worked example, tests**
-- Phase 3 — the OpenClaw adapter: SKILL.md, installer (cron lines, heartbeat
-  snippet, detector rules), the argv gate shim, delivery scripts. The gaps
-  are listed concretely in `examples/cranston/NOTES.md`.
+- **Phase 3 (in progress) — dual-harness packaging: done (one authoring
+  source generates the OpenClaw root artifact and the Hermes tap artifact,
+  drift-gated in CI). Still open: the OpenClaw runtime shims — the argv gate
+  wrapper, the Tailscale guard, delivery scripts, consent routing — listed
+  concretely in `references/example-cranston/NOTES.md`.**
 - Phase 4 — onboarding methodology (Discover/Decide) + registry publication.

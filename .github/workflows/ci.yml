@@ -1,0 +1,44 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build is deterministic and views are not hand-edited
+        run: |
+          python3 tools/build.py
+          git diff --exit-code || { echo "::error::generated views drifted - run tools/build.py and commit"; exit 1; }
+          python3 tools/check_drift.py
+
+      - name: Every bundled file is referenced from SKILL.md
+        run: python3 tools/validate_links.py
+
+      - name: Build tooling tests
+        run: python3 tests/test_build.py
+
+      - name: Engine suite
+        run: python3 tests/test_engine.py
+
+      - name: Template smoke tests (offline)
+        run: bash tests/test_templates.sh
+
+      # Generic example-LAN addresses (192.168.1.x) are allowed by design; this
+      # hunts real identifiers: secrets, home paths, non-doc-range tailnet IPs.
+      - name: No secrets, personal paths, or real tailnet IPs in the views
+        run: |
+          if grep -rInE "(api[_-]?key[\"': ]*=|BOT_TOKEN=[0-9]|/Users/|/home/(whiteglove|nero)|100\.1[0-9]{2}\.)" \
+              SKILL.md scripts references assets skills | grep -v "100\.64\.0\."; then
+            echo "::error::possible secret or machine-specific value in a generated view"
+            exit 1
+          fi
+
+# Native platform smoke tests (hermes CLI / openclaw CLI) are manual-only:
+#   hermes chat --toolsets skills -q "Use the cranston skill ..."
+#   openclaw skills install git:jetsharklambo/cranston-skill && openclaw skills check

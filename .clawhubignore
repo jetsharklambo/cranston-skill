@@ -1,0 +1,9 @@
+authoring/
+tools/
+tests/
+docs/
+skills/
+.github/
+CLAUDE.md
+AGENTS.md
+pyproject.toml

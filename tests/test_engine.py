@@ -28,7 +28,8 @@ REPO = Path(__file__).resolve().parents[1]
 
 tmp = Path(tempfile.mkdtemp(prefix="cranston-core-test-"))
 (tmp / "engine").mkdir()
-shutil.copy(REPO / "engine" / "selfheal.py", tmp / "engine" / "selfheal.py")
+shutil.copy(REPO / "authoring" / "scripts" / "engine" / "selfheal.py",
+            tmp / "engine" / "selfheal.py")
 
 spec = importlib.util.spec_from_file_location("sh", tmp / "engine" / "selfheal.py")
 sh = importlib.util.module_from_spec(spec)

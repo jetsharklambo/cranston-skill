@@ -7,10 +7,11 @@
 
 set -u
 REPO="$(cd "$(dirname "$0")/.." && pwd)"
-export SELFHEAL_ROOT="$REPO"
+SRCROOT="$REPO/authoring/scripts"
+export SELFHEAL_ROOT="$SRCROOT"
 T="$(mktemp -d)"
 export SELFHEAL_AUDIT_LOG="$T/audit.log"
-CK="$REPO/checks/templates"
+CK="$SRCROOT/checks/templates"
 PASS=0
 FAIL=0
 
@@ -135,10 +136,10 @@ HA_PID=$!
 for i in 1 2 3 4 5 6 7 8 9 10; do curl -s -o /dev/null "http://127.0.0.1:$HAPORT/api/states/switch.plug" && break; sleep 0.3; done
 assert "turn_on + verify -> exit 0" 0 - -- \
     REMEDIATION_KEY=rk HA_URL="http://127.0.0.1:$HAPORT" HA_TOKEN=x HA_ENTITY=switch.plug \
-    VERIFY_TRIES=3 VERIFY_SLEEP=0 bash "$REPO/remediations/templates/ha-service-call.sh"
+    VERIFY_TRIES=3 VERIFY_SLEEP=0 bash "$SRCROOT/remediations/templates/ha-service-call.sh"
 assert "turn_off is structurally refused (64)" 64 "not fail-safe-direction" -- \
     REMEDIATION_KEY=rk HA_URL="http://127.0.0.1:$HAPORT" HA_TOKEN=x HA_ENTITY=switch.plug \
-    HA_SERVICE=turn_off bash "$REPO/remediations/templates/ha-service-call.sh"
+    HA_SERVICE=turn_off bash "$SRCROOT/remediations/templates/ha-service-call.sh"
 kill $HA_PID 2>/dev/null; wait $HA_PID 2>/dev/null
 
 echo "== remediation library (cap / refuse / verify) =="
