@@ -1,0 +1,271 @@
+{
+  "version": 2,
+  "_note": "The cranston reference deployment translated to schema v2. WORKED EXAMPLE ONLY - never deployed; the live cranston box runs the frozen v1 stack in selfheal-project/. Paths assume the OpenClaw adapter layout on that box. See NOTES.md for the mapping and the open adapter gaps.",
+  "paths": {
+    "state_dir": "state",
+    "audit_log": "/home/homeadmin/.openclaw/logs/selfheal-automation.log",
+    "digest_file": "/home/homeadmin/.openclaw/workspace/memory/daily-downtime-log.jsonl",
+    "alert_sink": "/home/homeadmin/.openclaw/workspace/selfheal/bin/send-alert.sh",
+    "approval_gate": ["bash", "/home/homeadmin/.openclaw/workspace/bin/secure-bash-argv.sh"]
+  },
+  "defaults": {
+    "fail_threshold": 2,
+    "check_timeout_seconds": 45,
+    "cooldown_minutes": 30,
+    "max_attempts": 2,
+    "attempt_window_hours": 6,
+    "verify_delay_seconds": 45,
+    "realert_minutes": 60,
+    "recovery_hold_minutes": 10,
+    "pending_ttl_hours": 6,
+    "post_outage_grace_minutes": 6
+  },
+  "services": [
+    {
+      "name": "wifi-link",
+      "enabled": true,
+      "local": true,
+      "_note": "BESPOKE check kept: the iwlwifi microcode-crash signature and the escalating reset ladder are hardware-specific. Must be FIRST (the layer everything depends on); local:true keeps it running when the network gate trips.",
+      "check": "/home/homeadmin/.openclaw/workspace/selfheal/checks/check-wifi-link.sh",
+      "check_timeout_seconds": 30,
+      "verify_delay_seconds": 30,
+      "remediations": {
+        "WIFI_WEDGED": "/home/homeadmin/.openclaw/workspace/selfheal/remediations/reset-wifi-link.sh",
+        "WIFI_DISCONNECTED": "/home/homeadmin/.openclaw/workspace/selfheal/remediations/reset-wifi-link.sh",
+        "WIFI_LINK_UNREADABLE": null
+      }
+    },
+    {
+      "name": "home-assistant",
+      "enabled": true,
+      "_note": "TEMPLATE check-http replaces the bespoke check-ha.sh. HOST_DOWN proposes the HA-Pi outlet cycle - consent is 'household' because the cycle also takes down AdGuard, i.e. everyone's DNS, for 3-4 min.",
+      "check": "checks/templates/check-http.sh",
+      "params": {
+        "CHECK_KEY": "home-assistant",
+        "HTTP_URL": "http://192.168.1.35:8123/api/",
+        "HTTP_TOKEN_FILE": "/home/homeadmin/.ha_token_env",
+        "HTTP_AUTH_HEADER": "Authorization: Bearer $HA_TOKEN",
+        "HOST_IP": "192.168.1.35"
+      },
+      "verify_delay_seconds": 240,
+      "on_fail_forensics": "/home/homeadmin/.openclaw/workspace/selfheal/hooks/ha-forensics-capture.sh",
+      "on_recover_forensics": "/home/homeadmin/.openclaw/workspace/selfheal/hooks/ha-forensics-recover.sh",
+      "remediations": {
+        "HOST_DOWN": {
+          "ask": "/home/homeadmin/.openclaw/workspace/selfheal/remediations/outlet-power.sh",
+          "arg": "ha-host",
+          "consent": "household"
+        },
+        "SERVICE_DOWN": {
+          "ask": "/home/homeadmin/.openclaw/workspace/selfheal/remediations/reboot-ha-host.sh",
+          "consent": "household"
+        },
+        "AUTH_FAILED": null,
+        "API_ERROR": null
+      }
+    },
+    {
+      "name": "openclaw-gateway",
+      "enabled": true,
+      "local": true,
+      "_note": "TEMPLATE check-systemd-unit replaces check-gateway.sh; the dual-sink wedge heuristic is a template feature now.",
+      "check": "checks/templates/check-systemd-unit.sh",
+      "params": {
+        "CHECK_KEY": "openclaw-gateway",
+        "UNIT": "openclaw-gateway",
+        "UNIT_SCOPE": "user",
+        "PORT": "18789",
+        "LOG_GLOB": "/tmp/openclaw/openclaw-*.log",
+        "WEDGE_MINUTES": "75",
+        "REMEDIATION_KEY": "openclaw-gateway"
+      },
+      "verify_delay_seconds": 60,
+      "remediations": {
+        "UNIT_INACTIVE": "remediations/templates/restart-systemd-unit.sh",
+        "PORT_DEAD": "remediations/templates/restart-systemd-unit.sh",
+        "WEDGED": "remediations/templates/restart-systemd-unit.sh"
+      }
+    },
+    {
+      "name": "docker-macmini",
+      "enabled": true,
+      "_note": "BESPOKE check kept: the forced-command SSH wrapper + dual-transport probing of a REMOTE docker host is site plumbing (macmini-ssh.sh). v2's blind-root suppression now covers its known gap: MACMINI_UNREACHABLE/DOCKER_DAEMON_DOWN on the root key stops the container subkeys from reading falsely healthy.",
+      "check": "/home/homeadmin/.openclaw/workspace/selfheal/checks/check-docker-macmini.sh",
+      "containers_auto": ["totp-service", "syncthing"],
+      "containers_watch": ["hbbs", "hbbr", "open-webui"],
+      "remediations": {
+        "CONTAINER_DOWN": "/home/homeadmin/.openclaw/workspace/selfheal/remediations/restart-macmini-container.sh",
+        "CONTAINER_DOWN_WATCH": null,
+        "MACMINI_UNREACHABLE": null,
+        "DOCKER_DAEMON_DOWN": null
+      },
+      "realert_minutes_by_code": {
+        "MACMINI_UNREACHABLE": 300,
+        "CHECK_ERROR": 300
+      }
+    },
+    {
+      "name": "zigbee-stack",
+      "enabled": true,
+      "local": true,
+      "_note": "BESPOKE check kept (local containers + MQTT round-trip + bridge + per-device availability in dependency order). The rescue-power control plane heals itself; local:true because outlets matter most when the LAN is down.",
+      "check": "/home/homeadmin/.openclaw/workspace/selfheal/checks/check-zigbee-stack.sh",
+      "verify_delay_seconds": 60,
+      "remediations": {
+        "ZIGBEE_CONTAINER_DOWN": "/home/homeadmin/.openclaw/workspace/selfheal/remediations/restart-zigbee-stack.sh",
+        "MQTT_BROKER_DOWN": "/home/homeadmin/.openclaw/workspace/selfheal/remediations/restart-zigbee-stack.sh",
+        "Z2M_BRIDGE_OFFLINE": "/home/homeadmin/.openclaw/workspace/selfheal/remediations/restart-zigbee-stack.sh",
+        "STRIP_UNAVAILABLE": null,
+        "PLUG_UNAVAILABLE": null
+      },
+      "realert_minutes_by_code": {
+        "STRIP_UNAVAILABLE": 360,
+        "PLUG_UNAVAILABLE": 360
+      }
+    },
+    {
+      "name": "officedelta",
+      "enabled": true,
+      "_note": "BESPOKE check kept: the EcoFlow policy (persistent-blind fail-safe charging, AC-out guard, the four HA-automation watchdog codes) is this home's doctrine, not an archetype. The charge remediations are the fail-safe-direction pattern ha-service-call.sh generalizes.",
+      "check": "/home/homeadmin/.openclaw/workspace/selfheal/checks/check-officedelta.sh",
+      "verify_delay_seconds": 30,
+      "realert_minutes_by_code": {
+        "TOPUP_MISSED": 1440,
+        "PLUG_STUCK_ON": 1440,
+        "DELTA_AUTOMATION_DEGRADED": 1440,
+        "SOLAR_DEAD_DAYTIME": 1440
+      },
+      "notify_by_code": {
+        "DELTA_SOC_LOW": "digest"
+      },
+      "remediations": {
+        "DELTA_SOC_UNREADABLE": "/home/homeadmin/.openclaw/workspace/selfheal/remediations/charge-officedelta.sh",
+        "DELTA_SOC_LOW": "/home/homeadmin/.openclaw/workspace/selfheal/remediations/charge-officedelta.sh",
+        "DELTA_CRITICAL": null,
+        "PLUG_UNAVAILABLE": null,
+        "DELTA_AC_OUT_OFF": "/home/homeadmin/.openclaw/workspace/selfheal/remediations/enable-officedelta-ac.sh",
+        "TOPUP_MISSED": null,
+        "PLUG_STUCK_ON": null,
+        "DELTA_AUTOMATION_DEGRADED": null,
+        "SOLAR_DEAD_DAYTIME": null
+      }
+    },
+    {
+      "name": "adguard-dns",
+      "enabled": true,
+      "_note": "TEMPLATE check-dns replaces check-adguard.sh; upstream isolation and the owner-host gate are template features.",
+      "check": "checks/templates/check-dns.sh",
+      "params": {
+        "CHECK_KEY": "adguard-dns",
+        "RESOLVER_IP": "192.168.1.35",
+        "OWNER_HOST_IP": "192.168.1.35"
+      },
+      "verify_delay_seconds": 60,
+      "remediations": {
+        "DNS_DOWN": "/home/homeadmin/.openclaw/workspace/selfheal/remediations/restart-adguard.sh",
+        "UPSTREAM_DOWN": null
+      }
+    },
+    {
+      "name": "nike",
+      "enabled": true,
+      "_note": "BESPOKE check kept: the three-view probe (host sees the volume / docker binds see it / containers run) through a remote wrapper is site plumbing. A LOCAL volume gets the same protection from checks/templates/check-disk-space.sh with MARKER_DIRS.",
+      "check": "/home/homeadmin/.openclaw/workspace/selfheal/checks/check-nike.sh",
+      "check_timeout_seconds": 55,
+      "verify_delay_seconds": 60,
+      "remediations": {
+        "NIKE_ABSENT": null,
+        "NIKE_READONLY": null,
+        "NIKE_LOW_SPACE": null,
+        "NIKE_PROBE_FAILED": null,
+        "NIKE_DOCKER_BLIND": {
+          "ask": "/home/homeadmin/.openclaw/workspace/selfheal/remediations/restart-docker-desktop.sh",
+          "consent": "admin"
+        }
+      },
+      "realert_minutes_by_code": {
+        "NIKE_ABSENT": 1440,
+        "NIKE_READONLY": 1440,
+        "NIKE_LOW_SPACE": 1440,
+        "NIKE_PROBE_FAILED": 1440,
+        "NIKE_DOCKER_BLIND": 300
+      }
+    },
+    {
+      "name": "navidrome",
+      "enabled": true,
+      "_note": "TEMPLATE check-http replaces check-navidrome.sh: dual transport, ping split, LAN_UNREACHABLE/TRANSPORT_BLIND degraded findings, with the tailscale guard as ALT_GUARD_CMD. consent on the outlet cycle is 'admin' (music for the house, but the box is the admin's).",
+      "check": "checks/templates/check-http.sh",
+      "params": {
+        "CHECK_KEY": "navidrome",
+        "HTTP_URL": "http://192.168.1.58:4533/ping",
+        "HTTP_URL_ALT": "http://100.64.0.9:4533/ping",
+        "ALT_GUARD_CMD": "/home/homeadmin/.openclaw/workspace/bin/tailscale-running.sh",
+        "HOST_IP": "192.168.1.58"
+      },
+      "verify_delay_seconds": 120,
+      "remediations": {
+        "SERVICE_DOWN": null,
+        "LAN_UNREACHABLE": null,
+        "TRANSPORT_BLIND": null,
+        "HOST_DOWN": {
+          "ask": "/home/homeadmin/.openclaw/workspace/selfheal/remediations/outlet-power.sh",
+          "arg": "navidrome",
+          "consent": "admin"
+        }
+      },
+      "realert_minutes_by_code": {
+        "LAN_UNREACHABLE": 1440,
+        "TRANSPORT_BLIND": 1440,
+        "HOST_DOWN": 300
+      }
+    },
+    {
+      "name": "host-power",
+      "enabled": true,
+      "local": true,
+      "_note": "TEMPLATE check-host-power. Immediate-page class: the last message that can get out before the dead-man's switch fires.",
+      "check": "checks/templates/check-host-power.sh",
+      "params": {
+        "CHECK_KEY": "host-power",
+        "BAT_LOW_PCT": "50"
+      },
+      "remediations": {
+        "ON_EXTERNAL_POWER_LOST": null,
+        "INTERNAL_BATTERY_LOW": null,
+        "HOST_POWER_UNREADABLE": null
+      }
+    },
+    {
+      "name": "lan-inventory",
+      "enabled": true,
+      "_note": "TEMPLATE check-lan-inventory; the inventory JSON is unchanged from v1.",
+      "check": "checks/templates/check-lan-inventory.sh",
+      "params": {
+        "CHECK_KEY": "lan-inventory",
+        "INVENTORY_FILE": "/home/homeadmin/.openclaw/workspace/selfheal/lan-inventory.json"
+      },
+      "remediations": {
+        "DEVICE_CHANGED": null,
+        "HOST_UNREACHABLE": null,
+        "SELF_IP_CHANGED": null,
+        "CHECK_ERROR": null
+      }
+    },
+    {
+      "name": "llm-chain",
+      "enabled": true,
+      "_note": "BESPOKE check kept: reads the agent framework's session transcripts and model config - inherently adapter-coupled. The archetype (error streak + throttled 1-token probe) is documented for other adapters to reimplement.",
+      "check": "/home/homeadmin/.openclaw/workspace/selfheal/checks/check-llm-chain.sh",
+      "check_timeout_seconds": 40,
+      "realert_minutes_by_code": {
+        "LLM_PRIMARY_UNREACHABLE": 1440
+      },
+      "remediations": {
+        "LLM_TURNS_FAILING": null,
+        "LLM_PRIMARY_UNREACHABLE": null,
+        "CHECK_ERROR": null
+      }
+    }
+  ]
+}
