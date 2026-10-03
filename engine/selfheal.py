@@ -86,7 +86,7 @@ def argvify(v, root=ROOT):
     return [str(resolve(x, root)) if "/" in str(x) else str(x) for x in v]
 
 
-def local_network_up():
+def local_network_up(config_gw=None):
     """True unless our own default gateway is unreachable.
 
     When the gateway does not answer, every remote probe fails for ONE reason -
@@ -94,20 +94,33 @@ def local_network_up():
     misdiagnosis this guards against. Beyond an unreachable gateway those
     services are UNKNOWABLE, not failing: they must be skipped, not stepped.
 
-    Returns (up: bool, gw: str|None). No default route at all counts as down.
+    Gateway resolution order: SELFHEAL_GW_OVERRIDE env (tests win), then the
+    deployment's defaults.gateway_ip, then `ip route show default`. Set
+    gateway_ip on platforms where reading the route table doesn't work -
+    on Android/Termux the `ip` binary EXISTS but gets "permission denied"
+    on the netlink socket, and Android keeps default routes in per-network
+    tables anyway, so the main table reads empty even with root.
+
+    A FAILED route-table read fails OPEN: "couldn't read the table" is not
+    "no default route". Only a CLEAN read with no route counts as down -
+    treating a refused read as down made the gate fail closed and silent
+    (every remote service skipped forever, nothing alerting).
+
+    Returns (up: bool, gw: str|None).
     """
-    override = os.environ.get("SELFHEAL_GW_OVERRIDE")  # test-only
-    if override:
-        gw = override
-    else:
+    gw = os.environ.get("SELFHEAL_GW_OVERRIDE") or config_gw
+    if not gw:
         try:
-            out = subprocess.run(["ip", "route", "show", "default"],
-                                 capture_output=True, text=True, timeout=5).stdout.split()
+            r = subprocess.run(["ip", "route", "show", "default"],
+                               capture_output=True, text=True, timeout=5)
         except Exception:
-            return True, None  # fail OPEN: can't read the route table -> don't suppress
+            return True, None  # fail OPEN: can't run the tool -> don't suppress
+        if r.returncode != 0:
+            return True, None  # fail OPEN: tool present but refused the read
+        out = r.stdout.split()
         gw = out[out.index("via") + 1] if "via" in out else None
     if not gw:
-        return False, None
+        return False, None  # clean read, genuinely no default route
     for _ in range(2):
         try:
             if subprocess.run(["ping", "-c", "1", "-W", "2", gw],
@@ -564,7 +577,7 @@ class SelfHeal:
         return False
 
     def run(self):
-        net_up, gw = local_network_up()
+        net_up, gw = local_network_up(self.defaults.get("gateway_ip"))
         grace = self.network_grace_active(net_up)
         if not net_up or grace:
             enabled = [s for s in self.config["services"] if s.get("enabled", True)]

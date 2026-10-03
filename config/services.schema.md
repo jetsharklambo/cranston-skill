@@ -35,8 +35,14 @@ All relative paths resolve against the install root (the directory containing
     "pending_ttl_hours": 6,         // ask-first approval lifetime. RULE: any ask-first code's
                                     // realert interval must be SHORTER than this, so each
                                     // re-page renews the approval before it lapses
-    "post_outage_grace_minutes": 6  // after the local network returns, skip remote services
+    "post_outage_grace_minutes": 6, // after the local network returns, skip remote services
                                     // while the other hosts finish booting
+    "gateway_ip": null              // optional: the router IP for the network gate. Unset,
+                                    // the engine reads `ip route show default`. SET THIS on
+                                    // platforms where that read is restricted (Android/Termux:
+                                    // `ip` exists but gets netlink permission-denied). A failed
+                                    // route read fails OPEN; only a clean read with no default
+                                    // route counts as network-down.
   },
 
   "services": [

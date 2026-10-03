@@ -323,5 +323,45 @@ ok(len(hs.alerts) == 1 and "affects the household" in hs.alerts[0],
    "household consent surfaces in the page")
 ok(hs.pending["svcF"]["consent"] == "household", "consent stored on the pending entry")
 
+print("== 17. network gate: failed route read fails OPEN, clean empty read is down ==")
+class FakeResult:
+    def __init__(self, rc, stdout=""):
+        self.returncode = rc
+        self.stdout = stdout
+real_subprocess_run = sh.subprocess.run
+sh.subprocess.run = lambda *a, **k: FakeResult(1, "")   # `ip` refused (Android netlink)
+ok(sh.local_network_up() == (True, None), "ip exits non-zero -> fail open (network treated UP)")
+sh.subprocess.run = lambda *a, **k: FakeResult(0, "")   # clean read, no route
+ok(sh.local_network_up() == (False, None), "clean read with no default route -> down")
+def raise_oserror(*a, **k):
+    raise OSError("no such binary")
+sh.subprocess.run = raise_oserror
+ok(sh.local_network_up() == (True, None), "ip binary missing -> fail open")
+sh.subprocess.run = real_subprocess_run
+
+print("== 18. defaults.gateway_ip drives the gate instead of the route table ==")
+calls = []
+def fake_run(argv, **k):
+    calls.append(argv[0])
+    if argv[0] == "ip":
+        raise AssertionError("route table consulted despite gateway_ip")
+    return FakeResult(0, "")   # ping succeeds
+sh.subprocess.run = fake_run
+ok(sh.local_network_up("10.0.0.1") == (True, "10.0.0.1"),
+   "config gateway pinged, route table never read")
+ok(calls and all(c == "ping" for c in calls), "only ping was invoked")
+sh.subprocess.run = real_subprocess_run
+# and the engine passes defaults.gateway_ip through run()
+cfgw = json.loads(json.dumps(CONFIG))
+cfgw["defaults"]["gateway_ip"] = "10.9.9.9"
+hs = fresh(cfgw)
+hs.run_check = lambda svc: {}
+seen_gw = []
+real_lnu = sh.local_network_up
+sh.local_network_up = lambda g=None: (seen_gw.append(g), (True, g))[1]
+hs.run()
+sh.local_network_up = real_lnu
+ok(seen_gw == ["10.9.9.9"], "run() hands defaults.gateway_ip to the gate")
+
 print(f"\nALL {PASS} ASSERTIONS PASSED")
 shutil.rmtree(tmp)

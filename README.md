@@ -101,6 +101,50 @@ All targets and thresholds come from the service's `params` block — see
 `config/services.schema.md` for the contract and `examples/cranston/` for a
 12-service real-world configuration.
 
+## Prerequisites: the always-on box
+
+Cranston needs a device that is **always on and lives on your home LAN** —
+it must still be running when the internet is down, because that's the
+moment it exists for. A cloud VPS cannot do this job (it can't tell
+"internet down" from "house down", and it disappears from your house
+exactly when the WAN does). Software needs are tiny: `python3` 3.9+,
+`bash`, `curl`, `cron` (plus `dig`/`openssl` for two optional templates;
+the systemd/sysfs templates are Linux-only).
+
+Two posture rules, both paid for in the reference home's incident log:
+**wire it with Ethernet** (the monitor must not share a failure mode with
+the Wi-Fi it watches), and **make it survive power blips** (internal
+battery, UPS, or BIOS power-on-after-AC-loss — with the router and modem
+on the UPS too, or the survivor is blind).
+
+| Tier | Runs | Needs |
+|---|---|---|
+| A | the core engine (this repo) | ~anything POSIX, 512MB RAM |
+| B | A + an agent framework (OpenClaw etc.) | ~2GB RAM, Node.js |
+| C | B + a small local LLM fallback | 16GB+ RAM |
+
+Early-2026 picks (the RAM shortage made a built Pi 5 cost the same as an
+N100 mini, so the smart money is on reused hardware — fitting, for this
+project):
+
+| Budget | Pick |
+|---|---|
+| **Free** | An old laptop: wired Ethernet, charge limit 60–80%, lid-ignore. Built-in UPS and recovery screen. Tiers A–B, C with 16GB. The reference deployment is exactly this. |
+| **~$15** | Pi Zero 2 W + USB Ethernet: tier A watchdog only. |
+| **~$150** | Used 1-litre business PC (ThinkCentre Tiny / OptiPlex Micro / EliteDesk Mini), 8–13W idle + a ~$65 UPS. The homelab-consensus value pick. |
+| **~$500** | Mac mini M4 16GB (LaunchDaemons, not login items) or a Ryzen mini with 32GB — the only tier-C-at-usable-speed options. |
+
+**Would an old Android phone work?** Under Termux: yes for the engine, with
+real caveats — Android's phantom-process killer and battery managers fight
+always-on work and lose *silently*, so a stock-Android phone should never be
+the only monitor (set `defaults.gateway_ip`; Android blocks the route-table
+read the network gate otherwise uses). A postmarketOS-flashed phone is the
+trustworthy version. Full story, recipes, and the battery-swelling warnings:
+**[docs/hardware.md](docs/hardware.md)**.
+
+**Don't run it on:** a cloud VPS, a gaming desktop (idle watts), a VM on
+your daily-use machine, or the router/NAS it's supposed to watch.
+
 ## First deployment
 
 What a first install looks like today, honestly: the **core is standalone-able**
@@ -111,11 +155,10 @@ things it should watch.
 
 ### 0. Prerequisites
 
-- `python3` (3.9+, stdlib only), `bash`, `curl`, `cron`
-- `dig` for the DNS template, `openssl` for the cert template (optional)
-- A box that stays on. If it runs on battery-backed power, say so in its own
-  config — `check-host-power.sh` exists precisely for the machine doing the
-  watching.
+See **Prerequisites: the always-on box** above (and `docs/hardware.md` for
+the full device guide). If the box runs on battery-backed power, give it a
+`check-host-power.sh` service — that template exists precisely for the
+machine doing the watching.
 
 ### 1. Get the code and write your config
 
