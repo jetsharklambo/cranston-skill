@@ -428,6 +428,33 @@ r = subprocess.run([sys.executable, str(ah / "engine" / "approve-heal.py"), "svc
 pend = json.loads((ah / "state" / "pending-approvals.json").read_text())
 ok(r.returncode == 1 and "gate refused" in r.stdout and "svcX" in pend,
    "bad code: gate refusal surfaces and the pending approval is KEPT")
+
+print("== 21. approve-heal exports the deployment's audit log and state dir to the remediation ==")
+# Without SELFHEAL_AUDIT_LOG the remediation library falls back to a /tmp
+# file: the rate cap then counts every deployment on the box and the
+# EXEC/RESULT lines never reach the deployment's audit trail.
+env_out = ah / "fix-env.txt"
+fix_env = ah / "remediations" / "fix-env.sh"
+fix_env.write_text("#!/bin/bash\n"
+                   f"printf '%s|%s|%s' \"$SELFHEAL_AUDIT_LOG\" \"$SELFHEAL_STATE_DIR\" \"$SELFHEAL_ROOT\" > {env_out}\n"
+                   "exit 0\n")
+(ah / "state" / "pending-approvals.json").write_text(json.dumps(
+    {"svcX": {"status_code": "C", "script": str(fix_env), "arg": None, "expires": future}}))
+# a configured service with a passing check, so the post-heal VERIFY path
+# (which re-runs the check with the same env) is exercised too
+chk_ok = ah / "chk-ok.sh"
+chk_ok.write_text("#!/bin/bash\nexit 0\n")
+cfg["services"] = [{"name": "svcX", "check": str(chk_ok), "params": {"P": "1"}, "remediations": {}}]
+(ah / "services.json").write_text(json.dumps(cfg))
+r = subprocess.run([sys.executable, str(ah / "engine" / "approve-heal.py"), "svcX", "654321"],
+                   capture_output=True, text=True, env=env)
+got = env_out.read_text().split("|") if env_out.exists() else ["", "", ""]
+ok(r.returncode == 0 and "verified HEALTHY" in r.stdout,
+   "heal completed and the verify check ran (no crash on the verify path)")
+ok(Path(got[0]).resolve() == (ah / "state" / "audit.log").resolve(),
+   "SELFHEAL_AUDIT_LOG is the deployment's audit log")
+ok(Path(got[1]).resolve() == (ah / "state").resolve(), "SELFHEAL_STATE_DIR exported")
+ok(Path(got[2]).resolve() == ah.resolve(), "SELFHEAL_ROOT exported")
 shutil.rmtree(ah)
 
 print(f"\nALL {PASS} ASSERTIONS PASSED")

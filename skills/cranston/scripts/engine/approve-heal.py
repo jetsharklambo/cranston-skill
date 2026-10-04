@@ -54,7 +54,13 @@ def save(path, data):
     os.replace(tmp, path)
 
 
-def svc_env(svc):
+def svc_env(svc, state_dir, audit_log):
+    """Environment for the remediation (and the gate): the process env + the
+    service's params + the same engine exports selfheal.py's auto path sets.
+    SELFHEAL_AUDIT_LOG matters most: the remediation library counts its own
+    EXEC lines there for its rate cap and falls back to a /tmp file without
+    it - which split the audit trail and made the cap count every deployment
+    on the box (a bug the sandbox drills found)."""
     env = dict(os.environ, SELFHEAL_CALLER="approve-heal")
     for k, v in (svc or {}).get("params", {}).items():
         env[str(k)] = str(v)
@@ -63,6 +69,8 @@ def svc_env(svc):
     if svc and "containers_watch" in svc:
         env["SELFHEAL_CONTAINERS_WATCH"] = " ".join(svc["containers_watch"])
     env["SELFHEAL_ROOT"] = str(ROOT)
+    env["SELFHEAL_STATE_DIR"] = str(state_dir)
+    env["SELFHEAL_AUDIT_LOG"] = str(audit_log)
     return env
 
 
@@ -145,7 +153,7 @@ def main():
         # engine's 180s) so an interactive gate has room for the human.
         gate = argvify(config.get("paths", {}).get("approval_gate"))
         cmd = (gate or ["bash"]) + [str(resolve(script))] + ([arg] if arg else [])
-        env = svc_env(svc)
+        env = svc_env(svc, state_dir, audit_log)
         if gate_code:
             env["GATE_CODE"] = gate_code
         try:
@@ -180,7 +188,7 @@ def main():
                                      capture_output=True, text=True,
                                      timeout=svc.get("check_timeout_seconds",
                                                      config.get("defaults", {}).get("check_timeout_seconds", 45)) + 15,
-                                     env=svc_env(svc))
+                                     env=svc_env(svc, state_dir, audit_log))
                 still = any(json.loads(l).get("key") == key
                             for l in chk.stdout.splitlines() if l.strip().startswith("{"))
                 verdict = ("verified HEALTHY ✅" if chk.returncode == 0 or not still
