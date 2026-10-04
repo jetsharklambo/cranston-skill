@@ -1,0 +1,72 @@
+{
+  "version": 2,
+  "_note": "Sandbox config. Timings are shortened so drills finish in seconds; the real defaults live in assets/services.example.json. @SVCCTL@ is filled in by sandbox/up.sh.",
+  "paths": {
+    "state_dir": "state",
+    "audit_log": "state/audit.log",
+    "digest_file": "state/digest.jsonl",
+    "alert_sink": "bin/sandbox-sink.sh",
+    "approval_gate": null
+  },
+  "defaults": {
+    "fail_threshold": 2,
+    "check_timeout_seconds": 20,
+    "cooldown_minutes": 0,
+    "max_attempts": 2,
+    "attempt_window_hours": 6,
+    "verify_delay_seconds": 1,
+    "realert_minutes": 60,
+    "recovery_hold_minutes": 1,
+    "pending_ttl_hours": 6,
+    "post_outage_grace_minutes": 0,
+    "gateway_ip": "192.168.1.1"
+  },
+  "services": [
+    {
+      "name": "media-server",
+      "enabled": true,
+      "_note": "AUTO class: SERVICE_DOWN restarts it unasked; HOST_DOWN is watch-only.",
+      "check": "checks/templates/check-http.sh",
+      "params": {
+        "CHECK_KEY": "media-server",
+        "HTTP_URL": "http://127.0.0.1:18096/ping",
+        "HOST_IP": "192.168.1.58",
+        "FAKE_SVC": "media-server",
+        "SVCCTL": "@SVCCTL@"
+      },
+      "remediations": {
+        "SERVICE_DOWN": "remediations/sandbox-restart.sh",
+        "HOST_DOWN": null
+      }
+    },
+    {
+      "name": "nas",
+      "enabled": true,
+      "_note": "ASK-FIRST class: PORT_CLOSED pages and waits for 'heal nas'.",
+      "check": "checks/templates/check-tcp-port.sh",
+      "params": {
+        "CHECK_KEY": "nas",
+        "TCP_HOST": "127.0.0.1",
+        "TCP_PORT": "18445",
+        "SVCCTL": "@SVCCTL@"
+      },
+      "remediations": {
+        "PORT_CLOSED": { "ask": "remediations/sandbox-restart.sh", "arg": "nas", "consent": "household" },
+        "HOST_DOWN": null
+      }
+    },
+    {
+      "name": "box-disk",
+      "enabled": true,
+      "local": true,
+      "_note": "LOCAL service: keeps being checked while the router is unplugged.",
+      "check": "checks/templates/check-disk-space.sh",
+      "params": {
+        "CHECK_KEY": "box-disk",
+        "MOUNT_PATH": "/",
+        "MIN_FREE_PCT": "1"
+      },
+      "remediations": {}
+    }
+  ]
+}

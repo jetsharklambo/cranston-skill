@@ -1,0 +1,6 @@
+#!/bin/bash
+# ping shim for the sandbox LAN: a host "answers" when
+# $SANDBOX_RUN/lan/hosts/<ip> exists (svcctl plug/unplug). Flags are ignored;
+# the target is the last argument, matching how the engine and templates call it.
+for target; do :; done
+[ -n "${target:-}" ] && [ -e "${SANDBOX_RUN:?}/lan/hosts/$target" ]
