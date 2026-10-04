@@ -58,7 +58,7 @@ SKILL.md + scripts/ + references/ + assets/   GENERATED (OpenClaw root artifact)
 skills/cranston/                              GENERATED (Hermes tap artifact)
 tools/                  build.py + check_drift.py + validate_links.py
 tests/                  engine suite (60 assertions) + template smoke tests (51)
-                        + build tooling tests (22)
+                        + build tooling tests (22) + methodology guards (31)
 docs/                   the dual-platform repository spec + design notes
 ```
 
@@ -165,6 +165,15 @@ trustworthy version. Full story, recipes, and the battery-swelling warnings:
 
 **Don't run it on:** a cloud VPS, a gaming desktop (idle watts), a VM on
 your daily-use machine, or the router/NAS it's supposed to watch.
+
+## Onboarding: Cranston learns your home
+
+The pitch in the first paragraph — scan, ask, map, then stand watch — is a
+shipped, runnable methodology, not marketing: `references/methodology.md`
+indexes the four modules (discovery probes, the priority-of-needs interview,
+the failure-mode audit library, and the house doctrine template) an agent
+walks to produce a draft `services.json` and doctrine for you to review.
+Probes only observe, and nothing generated takes effect until you've read it.
 
 ## First deployment
 
@@ -335,15 +344,23 @@ mode-600 file the cron line sources.
 python3 tests/test_engine.py     # 60 assertions, isolated temp install
 bash tests/test_templates.sh     # 51 assertions, offline (local stub servers)
 python3 tests/test_build.py      # 22 assertions, build/drift/link tooling
+python3 tests/test_methodology.py # 31 assertions, onboarding-module guards
 ```
 
 ## Status / roadmap
 
-- Phase 1 — design blueprint: done (separate document; published as part of phase 4)
+- Phase 1 — design blueprint: done; published in distilled form as
+  `docs/design.md` (its methodology sections are superseded by the runnable
+  modules below)
 - **Phase 2 — this repo: engine v2, template library, worked example, tests**
 - **Phase 3 (in progress) — dual-harness packaging: done (one authoring
   source generates the OpenClaw root artifact and the Hermes tap artifact,
   drift-gated in CI). Still open: the OpenClaw runtime shims — the argv gate
   wrapper, the Tailscale guard, delivery scripts, consent routing — listed
   concretely in `references/example-cranston/NOTES.md`.**
-- Phase 4 — onboarding methodology (Discover/Decide) + registry publication.
+- **Phase 4 (in progress) — onboarding methodology: shipped.** Four runnable
+  modules under `references/` — `discovery.md` (D1–D9 probes), `interview.md`
+  (U1–U17), `failure-modes.md` (F1–F20 audits), `doctrine.md` (the house
+  doctrine template) — indexed by `references/methodology.md`, so an agent can
+  learn a home conversationally and draft `services.json` + a doctrine for the
+  admin to review. Still open: registry publication.

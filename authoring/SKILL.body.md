@@ -8,6 +8,8 @@ is not, and batches the rest into one daily digest.
 
 - The user asks to set up monitoring/self-healing for home infrastructure
   (DNS box, media server, Home Assistant, battery backup, containers, disks).
+- The user asks Cranston to learn/map/onboard their home — run the onboarding
+  flow (see "Onboard a home" in the Procedure).
 - A Cranston alert arrived (a page saying `Reply 'heal <key>'`, a `🚨`/`⚠️`
   page, or a daily digest) and the user wants it explained or acted on.
 - The user asks for the monitor's status, its pending approvals, or why a
@@ -30,6 +32,11 @@ is not, and batches the rest into one daily digest.
 | Check templates (9) | `{{SKILL_DIR}}/scripts/checks/templates/` |
 | Remediation templates | `{{SKILL_DIR}}/scripts/remediations/templates/` |
 | Approval-gate templates + interview | `{{SKILL_DIR}}/scripts/gates/`, `{{SKILL_DIR}}/references/approval-gates.md` |
+| Onboarding methodology (index) | `{{SKILL_DIR}}/references/methodology.md` |
+| Discovery probes (D1–D9) | `{{SKILL_DIR}}/references/discovery.md` |
+| Priority-of-needs interview (U1–U17) | `{{SKILL_DIR}}/references/interview.md` |
+| Failure-mode audit library (F1–F20) | `{{SKILL_DIR}}/references/failure-modes.md` |
+| House doctrine template | `{{SKILL_DIR}}/references/doctrine.md` |
 | Hardware guidance | `{{SKILL_DIR}}/references/hardware.md` |
 | Onboarding methodology (placeholder) | `{{SKILL_DIR}}/references/methodology.md` |
 | Live state (per deployment) | `<deploy-root>/state/state.json`, `pending-approvals.json`, `audit.log` |
@@ -100,6 +107,31 @@ is not, and batches the rest into one daily digest.
    */2 * * * * flock -n /tmp/cranston.cronlock python3 /opt/cranston/engine/selfheal.py >> /var/log/cranston.log 2>&1
    25 5 * * *  SELFHEAL_DIGEST_FILE=/opt/cranston/state/digest.jsonl SELFHEAL_NOTIFY_CMD=/opt/cranston/bin/my-sink.sh /opt/cranston/bin/flush-digest.sh
    ```
+
+### Onboard a home (the methodology)
+
+When the user asks Cranston to learn their home — or before writing a
+`services.json` from scratch — run the four-module flow (index:
+`{{SKILL_DIR}}/references/methodology.md`):
+
+1. **Discover** (`{{SKILL_DIR}}/references/discovery.md`): run the D1–D9
+   read-only probes, ask the per-category questions, and fill the inventory
+   draft. Probes only observe; nothing is changed.
+2. **Interview** (`{{SKILL_DIR}}/references/interview.md`): ask U1–U17 — the
+   values calls no probe can answer — either as one conversation or one
+   question per daily digest, the admin's choice. Each answer maps to named
+   config fields.
+3. **Audit** (`{{SKILL_DIR}}/references/failure-modes.md`): walk F1–F20
+   against the inventory; each hit becomes a service entry, a scheduled
+   audit, or a line in the doctrine's standing hands-on list.
+4. **Generate DRAFTS, never apply**: emit a draft `services.json` (map each
+   need onto a check/remediation template via its `params` block; start
+   small — three services the household feels beat twelve nobody notices)
+   and a draft house doctrine from
+   `{{SKILL_DIR}}/references/doctrine.md`. The admin reviews and owns both;
+   nothing is installed or scheduled until they approve.
+5. Then: the gate interview (next section), a `--once` dry-run, and cron —
+   exactly as in the Install procedure above.
 
 ### Choose the approval gate (interview)
 
