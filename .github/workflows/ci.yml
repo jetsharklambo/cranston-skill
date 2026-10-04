@@ -49,6 +49,9 @@ jobs:
       - name: Delivery suite (offline)
         run: bash tests/test_delivery.sh
 
+      - name: Installer suite (offline)
+        run: bash tests/test_install.sh
+
       # Generic example-LAN addresses (192.168.1.x) are allowed by design; this
       # hunts real identifiers: secrets, home paths, non-doc-range tailnet IPs.
       - name: No secrets, personal paths, or real tailnet IPs in the views

@@ -18,6 +18,9 @@ metadata:
       - name: TG_CHAT_ID
         required: false
         description: Used for the bundled Telegram sender bin/send-telegram.sh (the default delivery path); any alert sink command works.
+      - name: TG_ANNOUNCE_CHAT_ID
+        required: false
+        description: Used for routing consent pre-announcements to a shared chat via bin/notify-alerts.sh; unset means announcements go to the admin chat.
 ---
 # Cranston — self-healing home monitor
 
@@ -54,6 +57,7 @@ is not, and batches the rest into one daily digest.
 | Thing | Where |
 |---|---|
 | Engine (one cycle per cron run) | `{baseDir}/scripts/engine/selfheal.py` |
+| Scripted install (deploy copy, env skeleton, dry run, cron lines) | `{baseDir}/scripts/install.sh` |
 | Approve a pending fix | `{baseDir}/scripts/engine/approve-heal.py <key>` |
 | Helper libs checks/remediations source | `{baseDir}/scripts/engine/lib/` |
 | Alert queue, drainer, sender, digest flusher | `{baseDir}/scripts/bin/` |
@@ -98,6 +102,13 @@ is not, and batches the rest into one daily digest.
 
 ### Install
 
+Scripted: `bash {baseDir}/scripts/install.sh --deploy /opt/cranston`
+performs steps 1 and 3–4 below (deploy copy, env-file skeleton, dry run) and
+prints the step-5 cron lines; it never overwrites an existing `services.json`
+or env file, and only `--apply-cron` touches the crontab (with a backup).
+Re-run it after a skill upgrade to refresh the code directories. The manual
+steps:
+
 1. Create the deployment root and copy the engine out of the skill:
 
    ```bash
@@ -125,6 +136,7 @@ is not, and batches the rest into one daily digest.
    cat > /etc/cranston.env <<'EOF'
    export TG_BOT_TOKEN=<token from @BotFather>
    export TG_CHAT_ID=<chat id the bot may write to>
+   # export TG_ANNOUNCE_CHAT_ID=<optional second chat for household pre-announcements>
    export SELFHEAL_ALERT_FILE=/opt/cranston/state/alert-pending.json
    EOF
    chmod 600 /etc/cranston.env
@@ -145,6 +157,13 @@ is not, and batches the rest into one daily digest.
    EOF
    chmod +x "$DEPLOY/bin/my-sink.sh"
    ```
+
+   **Announcements**: with `TG_ANNOUNCE_CHAT_ID` set (a shared household
+   chat), remediation entries whose `consent` is `household` or
+   `named:<person>` get their plain-language `announce` text delivered there
+   just before the fix runs ("restarting the media box — music will stop
+   ~2 min"); unset, announcements fold into the admin page. See the consent
+   bullet in `references/services.schema.md`.
 
 4. Dry-run one cycle and inspect the state it writes:
 
@@ -252,8 +271,10 @@ python3 "$DEPLOY/engine/approve-heal.py" <key>
 The engine runs the remediation through `paths.approval_gate` if configured,
 then re-runs the service's check and reports the verified outcome. Relay that
 output to the admin verbatim. If the pending entry carries a `consent` field,
-it names whose evening the fix may ruin — give that household member a
-heads-up before approving, not after.
+it names whose evening the fix may ruin — `approve-heal.py` queues the entry's
+pre-announcement to the household automatically at approval time (see
+Install, "Announcements"), but a human heads-up before approving is still
+the polite default.
 
 ## Safety
 

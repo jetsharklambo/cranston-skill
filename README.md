@@ -191,9 +191,11 @@ What a first install looks like today, honestly: the **core is standalone-able**
 (engine + templates + the bundled Telegram delivery, or your own sender), and
 the OpenClaw runtime shims ship with it (`gates/secure-bash-argv.sh`,
 `bin/tailscale-running.sh`, and the `bin/notify-alerts.sh` →
-`bin/send-telegram.sh` delivery pair); an installer and consent routing are
-the phase-3 work still open. These steps assume a small always-on Linux box
-(a Pi, a NUC, an old laptop) that can reach the things it should watch.
+`bin/send-telegram.sh` delivery pair). `scripts/install.sh` automates steps
+1–3 and prints the step-4 cron lines (`--apply-cron` installs them with a
+backup); the manual steps below remain the reference. These steps assume a
+small always-on Linux box (a Pi, a NUC, an old laptop) that can reach the
+things it should watch.
 
 ### 0. Prerequisites
 
@@ -237,6 +239,7 @@ drainer; under `state/` it is off `/tmp`, which a reboot wipes):
 cat > /etc/cranston.env <<'EOF'
 export TG_BOT_TOKEN=<token from @BotFather>
 export TG_CHAT_ID=<chat id the bot may write to>
+# export TG_ANNOUNCE_CHAT_ID=<optional second chat: household pre-announcements>
 export SELFHEAL_ALERT_FILE=/opt/cranston/state/alert-pending.json
 EOF
 chmod 600 /etc/cranston.env
@@ -378,11 +381,12 @@ without them. Never put secret values in `services.json`; keep them in
 ## Running the tests
 
 ```
-python3 tests/test_engine.py     # 60 assertions, isolated temp install
-bash tests/test_templates.sh     # 51 assertions, offline (local stub servers)
-bash tests/test_delivery.sh      # offline: alert queue -> drainer -> sender contract
-python3 tests/test_build.py      # 22 assertions, build/drift/link tooling
-python3 tests/test_methodology.py # 31 assertions, onboarding-module guards
+python3 tests/test_engine.py     # engine + approve-heal, isolated temp install
+bash tests/test_templates.sh     # checks/remediations/gates, offline (local stub servers)
+bash tests/test_delivery.sh      # offline: alert queue -> drainer -> sender -> digest flusher
+bash tests/test_install.sh       # offline: install.sh layout/idempotence/cron (stub crontab)
+python3 tests/test_build.py      # build/drift/link tooling
+python3 tests/test_methodology.py # onboarding-module guards
 python3 tests/test_interview.py   # per-device interview tool: plan/answer/fill/reask rules
 ```
 
@@ -392,16 +396,19 @@ python3 tests/test_interview.py   # per-device interview tool: plan/answer/fill/
   `docs/design.md` (its methodology sections are superseded by the runnable
   modules below)
 - **Phase 2 — this repo: engine v2, template library, worked example, tests**
-- **Phase 3 (in progress) — dual-harness packaging: done (one authoring
+- **Phase 3 (done) — dual-harness packaging: one authoring
   source generates the OpenClaw root artifact and the Hermes tap artifact,
-  drift-gated in CI). The OpenClaw runtime shims ship:
+  drift-gated in CI. The OpenClaw runtime shims ship:
   `scripts/gates/secure-bash-argv.sh` (the argv gate wrapper for a
   one-shell-string secure-bash), `scripts/bin/tailscale-running.sh` (the
   `ALT_GUARD_CMD` for a tailnet second transport), and delivery —
   `scripts/bin/notify-alerts.sh` drains the `send-alert.sh` queue every
-  minute through `scripts/bin/send-telegram.sh`. Still open: an installer,
-  and consent routing (the engine carries `consent` on ask-first proposals;
-  the household-announce channel is not built).**
+  minute through `scripts/bin/send-telegram.sh`. The installer ships as
+  `scripts/install.sh` (deploy copy, env skeleton, dry run, cron lines;
+  `--apply-cron` opt-in), and consent routing ships as the announce channel
+  (`consent: household`/`named:<person>` entries queue a plain-language
+  pre-announcement, delivered to `TG_ANNOUNCE_CHAT_ID` or folded into the
+  admin page).**
 - **Phase 4 (in progress) — onboarding methodology: shipped.** Four runnable
   modules under `references/` — `discovery.md` (D1–D9 probes), `interview.md`
   (U1–U17), `failure-modes.md` (F1–F20 audits), `doctrine.md` (the house
