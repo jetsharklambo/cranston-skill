@@ -51,8 +51,9 @@ ok("hermes view renders ${HERMES_SKILL_DIR}",
    "${HERMES_SKILL_DIR}/scripts/engine/selfheal.py" in hermes_skill)
 ok("no unresolved tokens in either view",
    "{{" not in root_skill and "{{" not in hermes_skill)
-ok("hermes frontmatter has required_environment_variables",
-   "required_environment_variables:" in hermes_skill)
+ok("hermes frontmatter omits soft env (no required_environment_variables)",
+   "required_environment_variables" not in hermes_skill
+   and "TG_BOT_TOKEN" not in hermes_skill.split("---")[1])
 ok("hermes frontmatter has no openclaw namespace", "openclaw" not in hermes_skill.split("---")[1])
 ok("openclaw frontmatter gates only hard bins",
    re.search(r"bins: \[python3, bash, curl\]", root_skill) is not None)
@@ -113,6 +114,16 @@ ok("invalid slug rejected", r.returncode != 0 and "naming rules" in r.stderr)
 man.write_text(good.replace("mode: soft", "mode: sorta", 1))
 r = run(dst, "build.py")
 ok("invalid dependency mode rejected", r.returncode != 0 and "mode must be" in r.stderr)
+
+# a HARD env dep DOES render into Hermes required_environment_variables
+man.write_text(good.replace(
+    "    - name: TG_BOT_TOKEN\n      mode: soft",
+    "    - name: TG_BOT_TOKEN\n      mode: hard"))
+r = run(dst, "build.py")
+hm = (dst / "skills" / "cranston" / "SKILL.md").read_text()
+ok("hard env dep renders in hermes required_environment_variables",
+   r.returncode == 0 and "required_environment_variables:" in hm
+   and "TG_BOT_TOKEN" in hm.split("---")[1] and "TG_CHAT_ID" not in hm.split("---")[1])
 
 man.write_text(good.replace(
     "description: Self-healing home monitor that fixes, asks first, or digests",

@@ -227,7 +227,11 @@ def hermes_frontmatter(m):
         out.append("metadata:")
         out.append("  hermes:")
         out.extend(meta)
-    envs = deps.get("env") or []
+    # Hermes may prompt for declared variables at load time, so only HARD env
+    # dependencies belong in required_environment_variables. Soft env (e.g.
+    # the example sink's Telegram vars) is documented in the body instead -
+    # declaring it here made an optional convenience read as a requirement.
+    envs = [e for e in (deps.get("env") or []) if e.get("mode") == "hard"]
     if envs:
         out.append("required_environment_variables:")
         for e in envs:

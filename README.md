@@ -1,7 +1,10 @@
 # Cranston
 
-**A self-healing smart home agent you can put on top of OpenClaw, Hermes, or
-any agent framework that can send a message and gate a command.**
+**A self-healing smart home agent for OpenClaw — the reference and supported
+harness. The core is framework-agnostic by design (anything that can send a
+message and gate a command could carry it), and a Hermes package is generated
+from the same source, but OpenClaw is the only harness it has actually run
+behind; everything else is untested.**
 
 You built the smart home. The DNS box, the media server, the battery backup,
 the automations. Which makes you the house IT department — and your household
@@ -55,7 +58,7 @@ SKILL.md + scripts/ + references/ + assets/   GENERATED (OpenClaw root artifact)
 skills/cranston/                              GENERATED (Hermes tap artifact)
 tools/                  build.py + check_drift.py + validate_links.py
 tests/                  engine suite (56 assertions) + template smoke tests (36)
-                        + build tooling tests (21)
+                        + build tooling tests (22)
 docs/                   the dual-platform repository spec + design notes
 ```
 
@@ -282,14 +285,18 @@ OpenClaw installs the repository root (`SKILL.md` + `scripts/` +
 `references/` + `assets/`). Pin a tag instead of `@main` when
 reproducibility matters; Git-sourced installs are refreshed by reinstalling.
 
-### Hermes
+### Hermes (experimental)
 
 ```bash
 hermes skills tap add jetsharklambo/cranston-skill
 hermes skills install jetsharklambo/cranston-skill/cranston
 ```
 
-Hermes discovers the tap artifact at `skills/cranston/`.
+Hermes discovers the tap artifact at `skills/cranston/`. It is generated from
+the same source as the OpenClaw package and follows the documented tap
+conventions, but it has never been installed on a real Hermes deployment —
+expect rough edges, and reports are welcome. No Hermes-specific features will
+be added until one exists.
 
 ### Dependencies and secrets
 
@@ -304,7 +311,7 @@ mode-600 file the cron line sources.
 ```
 python3 tests/test_engine.py     # 56 assertions, isolated temp install
 bash tests/test_templates.sh     # 36 assertions, offline (local stub servers)
-python3 tests/test_build.py      # 21 assertions, build/drift/link tooling
+python3 tests/test_build.py      # 22 assertions, build/drift/link tooling
 ```
 
 ## Status / roadmap
