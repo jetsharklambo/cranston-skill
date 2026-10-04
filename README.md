@@ -14,9 +14,9 @@ that thing is, what it's connected to, how you configured it and what you
 wanted it to do in the first place. It builds a map — network, power chains,
 blast radii, who-feeds-whom — and then it stands watch: fixes what can be
 fixed safely without waking anyone, asks permission (from the *right* person)
-for what can't, and tells you about the rest once a day instead of thirty
-times. You talk to it through Telegram or WhatsApp; it executes through a
-2FA-gated, audited, allowlisted path.
+for what can't, and tells you about the rest once a day instead of running a
+commentary channel. You talk to it through Telegram or WhatsApp; it executes
+through a 2FA-gated, audited, allowlisted path.
 
 The goal isn't more automation. It's making the self-imposed home admin a
 better person to share a home with.
@@ -66,7 +66,7 @@ from system cron; the alert path never traverses an LLM. Per key:
 anti-flap threshold → auto remediation (capped, cooled down, verified) or
 ask-first proposal or watch-only alert → escalation when the cap is hit.
 Recoveries hold their ✅ for ten minutes so a flapping service collapses to
-one message with a flap count instead of thirty pages.
+one message with a flap count instead of a page per bounce.
 
 **Monitoring lies, so the engine distrusts itself.** When the default gateway
 is unreachable, remote services are *skipped* — unknowable, not failing.
@@ -79,8 +79,18 @@ otherwise the finding is a degraded `*_BLIND` that points at our side.
 (the page is the approval prompt, and each re-page renews it before the
 approval TTL lapses). Degraded and routine findings go to a daily digest with
 a cron fallback flusher. A failed digest write pages rather than dropping
-the line. The reference deployment's admin muted their channel at ~30
-pages/day — 75% of which was one unthrottled nag. Never again.
+the line. This isn't taste — it's what eight months of the reference
+deployment's full message history grades out to: of ~3,200 delivered
+messages, **only about one alert item in eight reported a real incident or a
+completed fix**. Roughly two-thirds were re-alerts of an already-known
+condition or a broken probe path blaming a healthy service; the two worst
+offenders were both "hourly re-page of a thing the admin already knew," one
+of which ran for sixteen straight days. Ask-first pages were the sharpest
+lesson: hundreds of permission pages across a handful of conditions produced
+approvals in the low single-digit percent — an unanswered ask that re-pages
+on a timer is indistinguishable from spam. And noise wasn't a one-time bug:
+each new detector shipped new noise until its realert and severity budget
+was designed in from the start, which is why every template here has one.
 
 **Safety is structural, not prose.** Remediations are fixed-content scripts
 taking at most one sanitized argument, run as argv through a configurable

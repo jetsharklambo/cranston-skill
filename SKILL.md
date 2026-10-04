@@ -179,7 +179,7 @@ heads-up before approving, not after.
 - **Nothing pages on the first bad cycle** — anti-flap needs two consecutive
   failures (~4 min at the */2 cadence). That's by design; don't "fix" it.
 - **A recovery ✅ is held ~10 minutes** so a flapping service collapses into
-  one message with a flap count instead of thirty pages.
+  one message with a flap count instead of a page per bounce.
 - **Blind is not down.** When the default gateway is unreachable, remote
   services are skipped as unknowable; when a service's root key has a
   finding, its subkeys are skipped too (a dead Docker daemon must not read as
