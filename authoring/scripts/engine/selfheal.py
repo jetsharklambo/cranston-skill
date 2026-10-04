@@ -361,6 +361,29 @@ class SelfHeal:
             minutes = self.opt(svc, "realert_minutes")
         return now() - parse_iso(rec["last_alert"]) > timedelta(minutes=minutes)
 
+    def demote_ask(self, rec, svc, code, route):
+        """Ask-first demotion: an unanswered ask must stop paging eventually.
+
+        The reference deployment's life audit measured 439 ask-first pages
+        across 7 conditions producing 15 approvals (~3%) - an unanswered ask
+        re-paging on the realert clock is indistinguishable from spam. After
+        ask_demote_after immediate pages of the same code with no approval,
+        further re-pages route to the daily digest. The pending entry keeps
+        renewing, so approval still works the whole time; a different code on
+        the key, or a recovery, resets the counter."""
+        if route != "immediate":
+            return route
+        if rec.get("ask_code") != code:
+            rec["ask_code"] = code
+            rec["ask_pages"] = 0
+        rec["ask_pages"] = rec.get("ask_pages", 0) + 1
+        limit = svc.get("ask_demote_after", self.defaults.get("ask_demote_after", 3))
+        if limit and rec["ask_pages"] > limit:
+            log(f"ask for this key paged {rec['ask_pages'] - 1}x with no approval "
+                f"-> demoting to digest (ask_demote_after={limit})")
+            return "digest"
+        return route
+
     # -- pending approvals ----------------------------------------------------
 
     def add_pending(self, key, code, script, arg, consent=None):
@@ -417,6 +440,9 @@ class SelfHeal:
                 rec["last_transition"] = iso(now())
             rec["status"] = "ok"
             rec["consecutive_failures"] = 0
+            # a recovery ends the ask thread: the next incident pages fresh
+            rec.pop("ask_pages", None)
+            rec.pop("ask_code", None)
             return
 
         flap = rec.get("flap")
@@ -449,9 +475,10 @@ class SelfHeal:
 
         if rec["status"] == "escalated":
             if self.realert_due(rec, svc, code):
+                route = self.demote_ask(rec, svc, code, "immediate")
                 self.alert(rec, f"\U0001f6a8 {key} STILL DOWN ({code}) — auto-restart cap "
                                 f"reached earlier. Reply 'heal {key}' to run the fix."
-                                f"{self.flap_suffix(rec)}")
+                                f"{self.flap_suffix(rec)}", route=route, system=key)
             return
 
         if isinstance(remediation, str):
@@ -483,6 +510,8 @@ class SelfHeal:
                 else:
                     proposal = "No safe automatic fix known — manual intervention needed."
                 route = self.notify_class(svc, code, degraded, bool(ask_script))
+                if ask_script:
+                    route = self.demote_ask(rec, svc, code, route)
                 rec["notify_class"] = route
                 self.alert(rec, f"{icon} {key} {word} — layer: {layer}. {detail}. {proposal}"
                                 f"{self.flap_suffix(rec)}", route=route, system=key)
@@ -502,10 +531,11 @@ class SelfHeal:
             # few minutes (attempt history survives recoveries by design); the
             # escalated branch re-nags STILL DOWN on the same schedule anyway.
             if self.realert_due(rec, svc, code):
+                route = self.demote_ask(rec, svc, code, "immediate")
                 self.alert(rec, f"\U0001f6a8 {key}: {detail}. Auto-restart cap reached "
                                 f"({max_attempts} per {self.opt(svc, 'attempt_window_hours')}h). "
                                 f"Reply 'heal {key}' to run {Path(script).name}."
-                                f"{self.flap_suffix(rec)}")
+                                f"{self.flap_suffix(rec)}", route=route, system=key)
             return
 
         cooldown = timedelta(minutes=self.opt(svc, "cooldown_minutes"))

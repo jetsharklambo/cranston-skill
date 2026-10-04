@@ -35,6 +35,11 @@ All relative paths resolve against the install root (the directory containing
     "pending_ttl_hours": 6,         // ask-first approval lifetime. RULE: any ask-first code's
                                     // realert interval must be SHORTER than this, so each
                                     // re-page renews the approval before it lapses
+    "ask_demote_after": 3,          // immediate pages an unanswered ask gets before further
+                                    // re-pages route to the daily digest (pending keeps
+                                    // renewing; recovery or a new code resets the count).
+                                    // The reference deployment measured 439 ask pages ->
+                                    // 15 approvals before this existed. 0 disables
     "post_outage_grace_minutes": 6, // after the local network returns, skip remote services
                                     // while the other hosts finish booting
     "gateway_ip": null              // optional: the router IP for the network gate. Unset,

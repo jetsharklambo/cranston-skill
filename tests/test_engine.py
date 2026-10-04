@@ -364,5 +364,29 @@ hs.run()
 sh.local_network_up = real_lnu
 ok(seen_gw == ["10.9.9.9"], "run() hands defaults.gateway_ip to the gate")
 
+print("== 19. ask-first demotion after 3 unanswered pages ==")
+clear_digest()
+hs = fresh()
+fa = {"status": "CODE_ASK", "layer": "l", "detail": "needs human"}
+hs.step(SVC_ASK, "svcC", fa)
+hs.step(SVC_ASK, "svcC", fa)                    # page 1 (immediate)
+for _ in range(2):                              # pages 2 and 3 on the realert clock
+    clock.advance(301)
+    hs.step(SVC_ASK, "svcC", fa)
+ok(len(hs.alerts) == 3, "three immediate pages allowed")
+ok(read_digest() == [], "nothing in the digest during the immediate phase")
+clock.advance(301)
+hs.step(SVC_ASK, "svcC", fa)                    # 4th re-page -> demoted
+ok(len(hs.alerts) == 3, "fourth re-page is NOT an immediate page")
+d = read_digest()
+ok(len(d) == 1 and "heal svcC" in d[0]["message"], "fourth re-page became a digest line")
+ok("svcC" in hs.pending, "pending approval still alive after demotion")
+hs.step(SVC_ASK, "svcC", None)                  # recovery resets the thread
+rec = hs.state["keys"]["svcC"]
+ok("ask_pages" not in rec and "ask_code" not in rec, "recovery clears the demotion counter")
+hs.step(SVC_ASK, "svcC", fa)
+hs.step(SVC_ASK, "svcC", fa)
+ok(len(hs.alerts) == 4, "a fresh incident pages immediately again")
+
 print(f"\nALL {PASS} ASSERTIONS PASSED")
 shutil.rmtree(tmp)

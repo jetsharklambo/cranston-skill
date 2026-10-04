@@ -54,7 +54,7 @@ authoring/              THE hand-edited source
 SKILL.md + scripts/ + references/ + assets/   GENERATED (OpenClaw root artifact)
 skills/cranston/                              GENERATED (Hermes tap artifact)
 tools/                  build.py + check_drift.py + validate_links.py
-tests/                  engine suite (49 assertions) + template smoke tests (36)
+tests/                  engine suite (56 assertions) + template smoke tests (36)
                         + build tooling tests (21)
 docs/                   the dual-platform repository spec + design notes
 ```
@@ -302,7 +302,7 @@ mode-600 file the cron line sources.
 ## Running the tests
 
 ```
-python3 tests/test_engine.py     # 49 assertions, isolated temp install
+python3 tests/test_engine.py     # 56 assertions, isolated temp install
 bash tests/test_templates.sh     # 36 assertions, offline (local stub servers)
 python3 tests/test_build.py      # 21 assertions, build/drift/link tooling
 ```

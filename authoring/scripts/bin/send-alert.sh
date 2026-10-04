@@ -4,6 +4,12 @@
 # deletes. Lock + merge + exact-line dedupe, so concurrent writers (the
 # engine, a critical-path cron, a stats collector) can't clobber each other.
 #
+# Delivery-contract note for adapters: the SENDER should also keep a short
+# sent-text window (skip a send whose exact text was delivered within ~30
+# min). The reference deployment's worst day ever was 530 deliveries from a
+# looping sender, and storm days repeat one text - queue-side dedupe (here)
+# cannot see what was already delivered.
+#
 # This is only the QUEUE half. The adapter owns delivery (e.g. OpenClaw's
 # notify-alerts.sh: every minute, derive the header from the worst line
 # present, send via the Bot API with a DNS fallback, delete on HTTP 2xx).
