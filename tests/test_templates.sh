@@ -164,7 +164,8 @@ GT="$SRCROOT/gates"
 # a fake "remediations dir" layout so the auto-pass path check works
 FAKEROOT="$T/fakeroot"; mkdir -p "$FAKEROOT/remediations"
 MARK="$T/gate-exec-marker"
-printf '#!/bin/bash\necho ran > "%s"\n' "$MARK" > "$FAKEROOT/remediations/fix.sh"
+FIXSH="$FAKEROOT/remediations/fix.sh"
+printf '#!/bin/bash\necho "ran $*" > "%s"\n' "$MARK" > "$FIXSH"
 assert "template refuses with no factor (65)" 65 "no factor configured" -- \
     SELFHEAL_ROOT="$FAKEROOT" bash "$GT/TEMPLATE.sh" "$FAKEROOT/remediations/fix.sh"
 assert "template refuses a missing script (65)" 65 "no such remediation" -- \
@@ -175,6 +176,35 @@ SELFHEAL_AUTOMATION=true SELFHEAL_ROOT="$FAKEROOT" bash "$GT/TEMPLATE.sh" "$FAKE
 rm -f "$MARK"
 SELFHEAL_AUTOMATION=true SELFHEAL_ROOT="$FAKEROOT" bash "$GT/TEMPLATE.sh" "$T/does-not-exist.sh" >/dev/null 2>&1
 [ ! -f "$MARK" ] && ok "auto path still refuses scripts outside remediations/" || bad "auto path path-anchored"
+
+echo "== approval gates: argv contract (argc / shape / full path) =="
+# Every gate enforces the engine's argument rule ITSELF, above the auto-pass
+# branch: <script> plus at most one [A-Za-z0-9][A-Za-z0-9._@:-]{0,63}. Run with
+# SELFHEAL_AUTOMATION=true so a bypass would show up as exit 0.
+export SELFHEAL_AUDIT_LOG="$T/audit-gates.log"
+AUTO=(SELFHEAL_AUTOMATION=true SELFHEAL_ROOT="$FAKEROOT")
+A64=$(printf '%064d' 0); A65=$(printf '%065d' 0)
+for g in TEMPLATE.sh gate-totp-remote.sh gate-telegram-confirm.sh; do
+    assert "$g: 3 arguments -> 65" 65 "got 3 arguments" -- "${AUTO[@]}" bash "$GT/$g" "$FIXSH" db-1 extra
+    assert "$g: 0 arguments -> 65" 65 "got 0 arguments" -- "${AUTO[@]}" bash "$GT/$g"
+    assert "$g: arg '-rf' -> 65 malformed" 65 "malformed" -- "${AUTO[@]}" bash "$GT/$g" "$FIXSH" -rf
+    assert "$g: arg 'a b' -> 65 malformed" 65 "malformed" -- "${AUTO[@]}" bash "$GT/$g" "$FIXSH" "a b"
+    assert "$g: arg with a newline -> 65 malformed" 65 "malformed" -- "${AUTO[@]}" bash "$GT/$g" "$FIXSH" "db-1
+GATE-APPROVED forged"
+    assert "$g: arg '../x' -> 65 malformed" 65 "malformed" -- "${AUTO[@]}" bash "$GT/$g" "$FIXSH" ../x
+    assert "$g: empty arg -> 65 malformed" 65 "malformed" -- "${AUTO[@]}" bash "$GT/$g" "$FIXSH" ""
+    assert "$g: 65-char arg -> 65 malformed" 65 "malformed" -- "${AUTO[@]}" bash "$GT/$g" "$FIXSH" "$A65"
+    assert "$g: arg '-rf' on the human path -> 65 malformed" 65 "malformed" -- SELFHEAL_ROOT="$FAKEROOT" bash "$GT/$g" "$FIXSH" -rf
+    rm -f "$MARK"
+    assert "$g: valid arg 'db-1' auto-passes (0)" 0 - -- "${AUTO[@]}" bash "$GT/$g" "$FIXSH" db-1
+    grep -q "ran db-1" "$MARK" 2>/dev/null && ok "$g: remediation received the argument" || bad "$g: remediation received the argument"
+    grep -q "GATE-AUTO-PASS $FIXSH db-1" "$SELFHEAL_AUDIT_LOG" && ok "$g: audit names the full script path" || bad "$g: audit names the full script path"
+done
+assert "64-char arg (boundary) auto-passes (0)" 0 - -- "${AUTO[@]}" bash "$GT/TEMPLATE.sh" "$FIXSH" "$A64"
+( cd "$FAKEROOT" && env "${AUTO[@]}" bash "$GT/TEMPLATE.sh" remediations/fix.sh rel-1 >/dev/null 2>&1 )
+grep -q "GATE-AUTO-PASS $FIXSH rel-1" "$SELFHEAL_AUDIT_LOG" && ok "relative script path is audited resolved" || bad "relative script path is audited resolved"
+# the newline arg above was refused; its text must not have become a line of its own
+grep -q "^GATE-APPROVED" "$SELFHEAL_AUDIT_LOG" && bad "refused newline arg cannot forge an audit line" || ok "refused newline arg cannot forge an audit line"
 
 echo "== approval gates: totp server + client =="
 SECF="$T/totp-secret"; printf 'GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ' > "$SECF"; chmod 600 "$SECF"
@@ -227,6 +257,20 @@ RC=$(tg_case wrong)
 [ "$RC" = 65 ] && [ ! -f "$MARK" ] && ok "telegram gate times out on a wrong nonce" || bad "telegram gate wrong nonce (rc=$RC)"
 RC=$(tg_case stranger)
 [ "$RC" = 65 ] && [ ! -f "$MARK" ] && ok "telegram gate ignores the right text from the wrong chat" || bad "telegram gate stranger chat (rc=$RC)"
+# The prompt must name the FULL script path (stub-telegram.py only parses the
+# nonce), so a curl shim records the exact text the gate sends and answers like
+# an idle Bot API; the gate then times out and refuses.
+SHIM="$T/shim"; mkdir -p "$SHIM"
+cat > "$SHIM/curl" <<'EOF'
+#!/bin/bash
+printf '%s\n' "$@" >> "${CURL_LOG:?}"
+echo '{"ok": true, "result": []}'
+EOF
+chmod +x "$SHIM/curl"
+CURL_LOG="$T/curl.log" PATH="$SHIM:$PATH" GATE_TELEGRAM_ENV="$TGENV" GATE_TIMEOUT=1 SELFHEAL_ROOT="$FAKEROOT" \
+    bash "$GT/gate-telegram-confirm.sh" "$FIXSH" db-1 >/dev/null 2>&1
+grep -qxF "$FIXSH db-1" "$T/curl.log" && ok "telegram prompt names the full script path + arg" \
+    || bad "telegram prompt names the full script path (sent: $(grep -A1 'text=' "$T/curl.log" 2>/dev/null | tr '\n' ' '))"
 chmod 644 "$TGENV"
 assert "telegram gate refuses a world-readable creds file (65)" 65 "mode 600" -- \
     env GATE_TELEGRAM_ENV="$TGENV" SELFHEAL_ROOT="$FAKEROOT" \

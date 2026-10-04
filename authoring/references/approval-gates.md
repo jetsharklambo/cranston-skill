@@ -14,6 +14,15 @@ command as *its own argv* and decides:
   shell string from anything a finding or a chat message produced.
 - **Refuse** → `exit 65` with a one-line reason on stdout (the engine and
   `approve-heal.py` surface it; 75 stays reserved for a remediation's own rate cap).
+- **Bound the argv yourself** → `exit 65` for anything but `<script>` plus at most
+  one argument, and for any argument that is not one token of letters, digits,
+  `.` `_` `@` `:` `-` — no leading `-`, no slash, no whitespace, 64 characters at
+  most (`[A-Za-z0-9][A-Za-z0-9._@:-]{0,63}`, the engine's own rule). The engine
+  checks it too; the gate re-checks because it never trusts its caller, and it
+  checks *before* the auto-pass branch so the engine's path is bounded as well.
+- **Show the full script path** — in the prompt and in the audit line, never the
+  basename: an admin approving `restart.sh` cannot tell
+  `/opt/cranston/remediations/restart.sh` from `/tmp/restart.sh`.
 
 Callers, distinguished by environment:
 
@@ -84,10 +93,14 @@ the admin's phone via a channel the gate reads directly (Tier 1).
 Start from `scripts/gates/TEMPLATE.sh`. Checklist:
 
 1. Exec through (`exec bash "$@"`); never eval; argv only.
-2. Keep the auto-path pass-through (step 1 in the template) or routine self-heals
+2. Bound the argv first (step 0 in the template): `$#` is 1 or 2, and `$2`, when
+   present, matches `[A-Za-z0-9][A-Za-z0-9._@:-]{0,63}` — otherwise exit 65. Keep
+   the check above the auto-path pass-through.
+3. Keep the auto-path pass-through (step 1 in the template) or routine self-heals
    stall on a human.
-3. Pin identities — chat id, verifier URL — in a mode-600 env file, never in
+4. Pin identities — chat id, verifier URL — in a mode-600 env file, never in
    `services.json`.
-4. Fail closed: timeout, unreachable verifier, malformed anything → exit 65.
-5. Audit every decision (`GATE-AUTO-PASS` / `GATE-APPROVED` / `GATE-REFUSED`).
-6. Test the refusal path before the approval path.
+5. Fail closed: timeout, unreachable verifier, malformed anything → exit 65.
+6. Audit every decision (`GATE-AUTO-PASS` / `GATE-APPROVED` / `GATE-REFUSED`) and
+   show the approver the full resolved script path, never the basename.
+7. Test the refusal path before the approval path.

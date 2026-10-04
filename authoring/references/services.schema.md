@@ -62,7 +62,9 @@ All relative paths resolve against the install root (the directory containing
       "params": {                   // exported as ENVIRONMENT to this service's check,
         "CHECK_KEY": "my-service",  // remediations and hooks. Every probe target, threshold
         "HTTP_URL": "http://192.168.1.10:8080/health"   // and device name lives here —
-      },                            // never inside a template.
+      },                            // never inside a template. SELFHEAL_*, GATE_* and PATH-like
+                                    // names (PATH, LD_*, PYTHON*, HOME, ...) are RESERVED: the
+                                    // engine refuses the whole service with CHECK_ERROR.
       "remediations": {             // finding code -> remediation class:
         "SERVICE_DOWN": "remediations/templates/restart-systemd-unit.sh",  // AUTO (string)
         "HOST_DOWN": { "ask": "remediations/my-outlet.sh", "arg": "svcoutlet",
@@ -108,6 +110,10 @@ All relative paths resolve against the install root (the directory containing
   composer: `"admin"` (default), `"named:<person>"`, or `"household"` —
   whose OK the fix needs is separate from whether the agent may act.
   (The engine stores and forwards it; enforcement wording is the adapter's.)
+- **`first_failed_at`** (a `state.json` record field) is stamped when a key's
+  current incident began; it survives re-pages (which move `last_transition`),
+  is cleared on recovery, and is what the interview's retire question reads to
+  ask about a device that has been failing for a week.
 
 ## The check contract (for template authors)
 
@@ -119,9 +125,20 @@ provably fine by another route and it is your VIEW that is broken. Exit 0
 silently when the root cause belongs to another service: one root cause, one
 alert.
 
+Finding keys must be the service `name` or `<name>/<subkey>`, where the subkey
+is letters, digits and `. _ @ : -` only — no leading `-`, no slash, no
+whitespace, max 64 characters — because it becomes the remediation's argument.
+Any other finding (another service's key, a traversal-shaped subkey, a missing
+or non-UPPER_SNAKE `status`) is rejected and surfaces as a `CHECK_ERROR` on the
+root key that counts the rejects and names the first.
+
 ## The remediation contract
 
 Fixed content; at most one argument; all targets from params. Exit 0
 fixed+verified, 1 failed/unverified, 64 refused, 75 refused-by-cap. Source
 `engine/lib/remediation.sh` and call `rem_begin` before anything else.
-Auto-class remediations act in the fail-safe direction only.
+Auto-class remediations act in the fail-safe direction only. The single
+argument must match the subkey pattern above (letters, digits, `. _ @ : -`, no
+leading `-`, no slash, max 64): the engine and `approve-heal.py` refuse to run
+otherwise (exit 64 / "⛔ refusing"), and a malformed pinned `arg` in an
+ask-first entry is ignored with a WARN — the proposal says so.

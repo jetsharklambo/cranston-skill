@@ -28,6 +28,9 @@ v2 over the proven v1 engine (cranston, 2026-07..10):
     network gate skips remote services (fixes the false-recovered-while-blind
     gap observed live 2026-10-02)
   - tunables pending_ttl_hours / post_outage_grace_minutes live in config
+  - findings are validated against the service's own key prefix (a subkey IS
+    the remediation's argument - ARG_RE), params may not set engine-owned
+    names (RESERVED_PARAM_RE), and records carry first_failed_at
 
 Single-instance via cron flock + fcntl lock on <state_dir>/.lock; state writes
 are atomic and shared with approve-heal.py.
@@ -46,6 +49,43 @@ from pathlib import Path
 
 BASE = Path(__file__).resolve().parent      # engine/
 ROOT = BASE.parent                          # install root
+
+# A finding's subkey doubles as the remediation's single argument, so both are
+# held to one shape: no leading '-', no slash, no whitespace, max 64 chars.
+# Keep the text identical to approve-heal.py's copy.
+ARG_RE = r"[A-Za-z0-9][A-Za-z0-9._@:-]{0,63}"
+# A finding's status code: UPPER_SNAKE, the way every template emits it.
+STATUS_RE = r"[A-Z][A-Z0-9_]{0,63}"
+# Names a service's params block may NOT set. SELFHEAL_* and GATE_* are
+# engine-owned (SELFHEAL_AUTOMATION is the gate's auto-pass marker, GATE_* its
+# second factor) and the PATH-like names change what a child process executes
+# or how its interpreter behaves. Keep identical to approve-heal.py's copy.
+RESERVED_PARAM_RE = r"^(SELFHEAL_|GATE_|LD_|BASH_|PYTHON|SHELLOPTS$|PATH$|ENV$|CDPATH$|IFS$|HOME$)"
+
+
+def reserved_param(svc):
+    """The first reserved key in a service's params block, or None."""
+    for k in (svc or {}).get("params", {}):
+        if re.match(RESERVED_PARAM_RE, str(k)):
+            return str(k)
+    return None
+
+
+def valid_finding(name, f):
+    """A check may only report on its own keys - the root key, or
+    <name>/<subkey> with the subkey shaped like a remediation argument (it
+    becomes one) - and must carry an UPPER_SNAKE status string (a missing
+    one used to KeyError the whole cycle)."""
+    if not isinstance(f, dict):
+        return False
+    key, status = f.get("key"), f.get("status")
+    if not isinstance(key, str) or not isinstance(status, str):
+        return False
+    if not re.fullmatch(STATUS_RE, status):
+        return False
+    if key == name:
+        return True
+    return key.startswith(name + "/") and re.fullmatch(ARG_RE, key[len(name) + 1:]) is not None
 
 
 def now():
@@ -206,8 +246,11 @@ class SelfHeal:
 
     def check_env(self, svc):
         """Environment for this service's check, remediations and hooks:
-        the process env + the service's params block + engine exports."""
+        the process env + the service's params block + engine exports.
+        An inherited SELFHEAL_AUTOMATION is dropped first: run_remediation
+        sets it explicitly for the gate; checks and hooks must never see it."""
         env = dict(os.environ)
+        env.pop("SELFHEAL_AUTOMATION", None)
         for k, v in svc.get("params", {}).items():
             env[str(k)] = str(v)
         # legacy container-list shorthand (predates params; kept working)
@@ -224,6 +267,13 @@ class SelfHeal:
 
     def run_check(self, svc):
         """Return {key: finding} for this service ({} = all healthy)."""
+        bad = reserved_param(svc)
+        if bad:
+            # nothing of this service runs with its env poisoned: no check,
+            # no hook, no remediation (run_hook / run_remediation refuse too)
+            return {svc["name"]: {"status": "CHECK_ERROR", "layer": "selfheal",
+                                  "detail": f"params sets reserved key {bad} - remove it "
+                                            f"(SELFHEAL_*/GATE_*/PATH-like names are engine-owned)"}}
         timeout = self.opt(svc, "check_timeout_seconds")
         try:
             r = subprocess.run(
@@ -240,15 +290,31 @@ class SelfHeal:
         if r.returncode == 0:
             return {}
         findings = {}
+        rejected, first_bad = 0, None
         for line in r.stdout.splitlines():
             line = line.strip()
             if not line:
                 continue
             try:
                 f = json.loads(line)
-                findings[f["key"]] = f
             except Exception:
-                pass
+                f = None
+            # Only findings on this service's own keys count; anything else
+            # (another service's key, a traversal-shaped subkey, no status) is
+            # dropped and surfaced below instead of being stepped or crashing.
+            if not valid_finding(svc["name"], f):
+                rejected += 1
+                if first_bad is None:
+                    first_bad = (f"key={f.get('key')!r} status={f.get('status')!r}"
+                                 if isinstance(f, dict) else line)[:120]
+                continue
+            findings[f["key"]] = f
+        if rejected:
+            log(f"{svc['name']}: {rejected} finding(s) rejected - first: {first_bad}")
+            findings.setdefault(svc["name"], {
+                "status": "CHECK_ERROR", "layer": "selfheal",
+                "detail": f"{rejected} finding(s) rejected (key must be {svc['name']} or "
+                          f"{svc['name']}/<subkey>, status UPPER_SNAKE) - first: {first_bad}"})
         if r.returncode != 1 or not findings:
             findings.setdefault(svc["name"], {
                 "status": "CHECK_ERROR", "layer": "selfheal",
@@ -261,9 +327,14 @@ class SelfHeal:
     def run_remediation(self, svc, script, arg):
         """Run a remediation through the approval gate as argv - never a shell
         string. Gate contract: gate_argv + [script_path] (+ [arg])."""
+        if arg is not None and not re.fullmatch(ARG_RE, str(arg)):
+            return 64, "refused: invalid remediation argument"
+        bad = reserved_param(svc)
+        if bad:
+            return 64, f"refused: params sets reserved key {bad}"
         argv = (self.approval_gate or ["bash"]) + [str(resolve(script))]
         if arg:
-            argv.append(arg)
+            argv.append(str(arg))
         env = self.check_env(svc)
         env.update(SELFHEAL_AUTOMATION="true", SELFHEAL_CALLER="selfheal.py")
         try:
@@ -278,7 +349,7 @@ class SelfHeal:
         """Run an optional read-only forensics script; return its last stdout
         line as a short summary (empty string if none/failed)."""
         script = svc.get(hook_key)
-        if not script:
+        if not script or reserved_param(svc):  # poisoned params: nothing runs
             return ""
         try:
             r = subprocess.run(["bash", str(resolve(script))], capture_output=True,
@@ -440,6 +511,7 @@ class SelfHeal:
                 rec["last_transition"] = iso(now())
             rec["status"] = "ok"
             rec["consecutive_failures"] = 0
+            rec.pop("first_failed_at", None)  # the incident is over
             # a recovery ends the ask thread: the next incident pages fresh
             rec.pop("ask_pages", None)
             rec.pop("ask_code", None)
@@ -453,6 +525,8 @@ class SelfHeal:
             flap.pop("pending_since", None)
             log(f"{key}: re-failed within recovery hold - flap #{flap['count']}, ✅ suppressed")
         rec["consecutive_failures"] += 1
+        # when this incident began; last_transition moves on every re-page, this does not
+        rec.setdefault("first_failed_at", iso(now()))
         code = finding["status"]
         rec["last_status_code"] = code
         if rec["consecutive_failures"] < threshold:
@@ -487,8 +561,17 @@ class SelfHeal:
             ask_script = remediation.get("ask") if isinstance(remediation, dict) else None
             # An ask-first entry may pin a fixed argument for its script so one
             # remediation can serve several services without a service/arg key.
+            pinned_note = ""
             if isinstance(remediation, dict) and remediation.get("arg"):
-                arg = remediation["arg"]
+                if re.fullmatch(ARG_RE, str(remediation["arg"])):
+                    arg = str(remediation["arg"])
+                else:
+                    # a malformed pin is a config bug, not a reason to go
+                    # quiet: page without it (the script gets no argument)
+                    log(f"WARN: {key}: pinned arg {remediation['arg']!r} for {code} is "
+                        f"malformed (must match {ARG_RE}) - ignored")
+                    arg = None
+                    pinned_note = " (pinned arg ignored as malformed - fix services.json)"
             # A fresh transition into failure pages immediately - except
             # mid-flap, where every re-confirmation is a "fresh" transition
             # and the realert window gates re-pages like any chronic failure.
@@ -504,7 +587,7 @@ class SelfHeal:
                     if consent and consent != "admin":
                         who = consent.split(":", 1)[-1] if consent.startswith("named:") else "the household"
                         scope = f" This affects {who} — give them a heads-up."
-                    proposal = (f"Proposed fix: {Path(ask_script).name} (ask-first). "
+                    proposal = (f"Proposed fix: {Path(ask_script).name} (ask-first){pinned_note}. "
                                 f"Reply 'heal {key}' to approve.{scope}")
                     self.add_pending(key, code, ask_script, arg, consent)
                 else:
@@ -564,6 +647,7 @@ class SelfHeal:
                        route="digest" if routine else "immediate", system=key)
             rec["status"] = "ok"
             rec["consecutive_failures"] = 0
+            rec.pop("first_failed_at", None)  # the incident is over
         else:
             why = f"exit {rc}" if rc != 0 else "verification still failing"
             rec["notify_class"] = "immediate"

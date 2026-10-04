@@ -9,7 +9,10 @@ Groups 1-10 port the proven v1 consolidation suite (digest routing, recovery
 hold-off / flap collapse, ask-first realert renewal, cap gating, legacy-state
 compat). Groups 11+ cover what v2 added: params in the child env, relative
 path resolution, pluggable alert_sink / approval_gate argv edges, blind-root
-suppression, config-driven TTL, consent carriage.
+suppression, config-driven TTL, consent carriage. Groups 22-26 cover the
+hardening: approve-heal strips the automation marker and GATE_* from its
+inherited env, reserved params keys, finding-key validation, remediation
+argument sanitization, and first_failed_at in state.
 
 Run anywhere: python3 tests/test_engine.py
 """
@@ -456,6 +459,168 @@ ok(Path(got[0]).resolve() == (ah / "state" / "audit.log").resolve(),
 ok(Path(got[1]).resolve() == (ah / "state").resolve(), "SELFHEAL_STATE_DIR exported")
 ok(Path(got[2]).resolve() == ah.resolve(), "SELFHEAL_ROOT exported")
 shutil.rmtree(ah)
+
+print("== 22. approve-heal strips SELFHEAL_AUTOMATION and GATE_* from the inherited env ==")
+# Every gate template passes an allowlisted script through without a human
+# when SELFHEAL_AUTOMATION=true, so an inherited marker (or one planted via
+# params) skipped the second factor; an inherited GATE_* could repoint a
+# gate's verifier. The gate below has the template's auto-pass branch on
+# purpose: if the marker leaked, the no-code run WOULD succeed.
+ah = Path(tempfile.mkdtemp(prefix="cranston-ah-test-"))
+for d in ("engine", "state", "remediations"):
+    (ah / d).mkdir()
+shutil.copy(REPO / "authoring" / "scripts" / "engine" / "approve-heal.py",
+            ah / "engine" / "approve-heal.py")
+gate_out = ah / "gate-env.txt"
+gate = ah / "my-gate.sh"
+gate.write_text("#!/bin/bash\n"
+                f"echo \"auto=${{SELFHEAL_AUTOMATION:-UNSET}} totp=${{GATE_TOTP_URL:-UNSET}} "
+                f"code=${{GATE_CODE:-UNSET}} caller=$SELFHEAL_CALLER\" > {gate_out}\n"
+                "if [ \"${SELFHEAL_AUTOMATION:-}\" = \"true\" ]; then exec bash \"$@\"; fi\n"
+                "if [ \"${GATE_CODE:-}\" = \"654321\" ]; then exec bash \"$@\"; fi\n"
+                "echo \"gate: bad code\"; exit 65\n")
+fix = ah / "remediations" / "fix.sh"
+fix.write_text("#!/bin/bash\nexit 0\n")
+chk_ok = ah / "chk-ok.sh"
+chk_ok.write_text("#!/bin/bash\nexit 0\n")
+cfg = {"version": 2, "paths": {"approval_gate": str(gate)},
+       "defaults": {"verify_delay_seconds": 0, "check_timeout_seconds": 5},
+       "services": [{"name": "svcX", "check": str(chk_ok), "params": {"P": "1"}, "remediations": {}}]}
+(ah / "services.json").write_text(json.dumps(cfg))
+future = "2099-01-01T00:00:00Z"
+def reset_pending(arg=None):
+    (ah / "state" / "pending-approvals.json").write_text(json.dumps(
+        {"svcX": {"status_code": "C", "script": str(fix), "arg": arg, "expires": future}}))
+def pending_kept():
+    return "svcX" in json.loads((ah / "state" / "pending-approvals.json").read_text())
+def approved_execs():
+    p = ah / "state" / "audit.log"
+    return p.read_text().count("APPROVED-EXEC") if p.exists() else 0
+evil_env = dict(os.environ, SELFHEAL_CONFIG=str(ah / "services.json"),
+                SELFHEAL_AUTOMATION="true", GATE_TOTP_URL="http://evil")
+def approve(*argv):
+    return subprocess.run([sys.executable, str(ah / "engine" / "approve-heal.py"), *argv],
+                          capture_output=True, text=True, env=evil_env)
+reset_pending()
+r = approve("svcX")                        # no code: only a leaked marker could pass
+seen = gate_out.read_text() if gate_out.exists() else ""
+ok(r.returncode == 1 and "gate refused" in r.stdout and "auto=UNSET" in seen,
+   "inherited SELFHEAL_AUTOMATION=true never reaches the gate: no code, no pass")
+ok("totp=UNSET" in seen and pending_kept(), "inherited GATE_TOTP_URL stripped; pending kept")
+reset_pending()
+r = approve("svcX", "654321")
+seen = gate_out.read_text() if gate_out.exists() else ""
+ok(r.returncode == 0 and "completed" in r.stdout, "with a code the gate approves and the heal completes")
+ok("code=654321" in seen and "caller=approve-heal" in seen and "auto=UNSET" in seen
+   and "totp=UNSET" in seen, "gate saw GATE_CODE and the caller, nothing inherited")
+n_exec = approved_execs()                  # baseline: refusals below must not add to it
+# a params block planting the marker: refused before anything runs
+cfg["services"][0]["params"] = {"P": "1", "SELFHEAL_AUTOMATION": "true"}
+(ah / "services.json").write_text(json.dumps(cfg))
+reset_pending()
+gate_out.unlink()
+r = approve("svcX", "654321")
+ok(r.returncode == 1 and "reserved key" in r.stdout and "SELFHEAL_AUTOMATION" in r.stdout,
+   "params setting SELFHEAL_AUTOMATION: approve-heal refuses and names the key")
+ok(pending_kept() and not gate_out.exists() and approved_execs() == n_exec,
+   "pending kept, gate never ran, nothing audited as executed")
+# a pending entry with a malformed argument: refused the same way
+cfg["services"][0]["params"] = {"P": "1"}
+(ah / "services.json").write_text(json.dumps(cfg))
+reset_pending(arg="-rf")
+r = approve("svcX", "654321")
+ok(r.returncode == 1 and "invalid argument" in r.stdout and pending_kept()
+   and not gate_out.exists() and approved_execs() == n_exec,
+   "pending entry with arg '-rf': refused, pending kept, nothing ran")
+shutil.rmtree(ah)
+
+print("== 23. engine: a reserved params key yields CHECK_ERROR and nothing of the service runs ==")
+marker = tmp / "reserved-ran.txt"
+check_marker = write_exec(tmp / "checks" / "marker.sh", f'#!/bin/bash\ntouch "{marker}"\nexit 0\n')
+svc_r = {"name": "svcR", "enabled": True, "local": True, "check": check_marker,
+         "on_fail_forensics": check_marker, "verify_delay_seconds": 0,
+         "params": {"CHECK_KEY": "svcR", "SELFHEAL_AUTOMATION": "true"},
+         "remediations": {"CHECK_ERROR": "/x/auto.sh"}}
+cfgr = json.loads(json.dumps(CONFIG)); cfgr["services"] = [svc_r]
+cfg_path.write_text(json.dumps(cfgr))
+hs = sh.SelfHeal(str(cfg_path))            # real run_hook kept on purpose
+hs.flush_alerts = lambda: None
+f = hs.run_check(svc_r)
+ok(f["svcR"]["status"] == "CHECK_ERROR" and "reserved key SELFHEAL_AUTOMATION" in f["svcR"]["detail"],
+   "reserved params key -> synthesized CHECK_ERROR naming the key")
+ok(not marker.exists(), "the check was never executed")
+ok(hs.run_hook(svc_r, "on_fail_forensics") == "" and not marker.exists(), "hooks do not run either")
+rc, out = hs.run_remediation(svc_r, "/x/auto.sh", None)
+ok(rc == 64 and "reserved key" in out, "remediations are refused for the same reason")
+hs.run(); hs.run()                          # two full cycles: confirm + attempted remediation
+ok(not marker.exists() and hs.state["keys"]["svcR"]["last_status_code"] == "CHECK_ERROR",
+   "full cycles complete with nothing of the service executed")
+ok(any("reserved key" in a for a in hs.alerts), "the page names the reserved key")
+
+print("== 24. finding validation: foreign keys, traversal subkeys and status-less lines ==")
+check_bad = write_exec(tmp / "checks" / "bad-findings.sh", "#!/bin/bash\n"
+    'echo \'{"key": "other/x", "status": "X_DOWN", "layer": "l", "detail": "not mine"}\'\n'
+    'echo \'{"key": "svcA/../../etc", "status": "X_DOWN", "layer": "l", "detail": "traversal"}\'\n'
+    'echo \'{"key": "svcA", "layer": "l", "detail": "no status at all"}\'\n'
+    'echo \'{"key": "svcA/db-1", "status": "DB_DOWN", "layer": "db", "detail": "replica down"}\'\n'
+    "exit 1\n")
+svc_v = {"name": "svcA", "enabled": True, "local": True, "check": check_bad,
+         "verify_delay_seconds": 0, "remediations": {"DB_DOWN": "/x/auto.sh"}}
+cfgv = json.loads(json.dumps(CONFIG)); cfgv["services"] = [svc_v]
+hs = fresh(cfgv)
+hs.state = {"keys": {}}
+captured = []
+hs.run_remediation = lambda svc, script, arg: (captured.append(arg), (0, "ok"))[1]
+f = hs.run_check(svc_v)
+ok(set(f) == {"svcA", "svcA/db-1"}, "only the root CHECK_ERROR and the valid subkey finding survive")
+ok(f["svcA"]["status"] == "CHECK_ERROR" and "3 finding(s) rejected" in f["svcA"]["detail"]
+   and "other/x" in f["svcA"]["detail"], "synthesized CHECK_ERROR counts the rejects and names the first")
+hs.run(); hs.run()                          # threshold 2: the second cycle remediates svcA/db-1
+ok(captured == ["db-1"], "the valid subkey's arg reached run_remediation; no crash on the status-less line")
+ok(not any("/../" in k or k.startswith("other") for k in hs.state["keys"]),
+   "no foreign or traversal key entered state")
+
+print("== 25. invalid remediation argument refused; malformed pinned ask arg ignored with a WARN ==")
+hs = fresh()
+ok(hs.run_remediation(SVC_AUTO, "/x/auto.sh", "-rf") == (64, "refused: invalid remediation argument"),
+   "run_remediation refuses arg '-rf' without running")
+ok(hs.run_remediation(SVC_AUTO, "/x/auto.sh", "a/b")[0] == 64, "a slash in the arg is refused too")
+svc_pin = {"name": "svcG", "enabled": True, "local": True, "check": "unused",
+           "remediations": {"CODE_PIN": {"ask": "/x/fix-it.sh", "arg": "bad arg"}}}
+fg = {"status": "CODE_PIN", "layer": "l", "detail": "needs a pin"}
+logged = []
+real_log = sh.log
+sh.log = lambda m: logged.append(m)
+hs.step(svc_pin, "svcG", fg)
+hs.step(svc_pin, "svcG", fg)
+sh.log = real_log
+ok(any("WARN" in m and "malformed" in m and "bad arg" in m for m in logged), "malformed pinned arg logged as WARN")
+ok(hs.pending["svcG"]["arg"] is None, "the pending entry carries no argument")
+ok(len(hs.alerts) == 1 and "pinned arg ignored" in hs.alerts[0], "the proposal says the pin was ignored")
+svc_pin["remediations"]["CODE_PIN"]["arg"] = "outlet-7"
+hs = fresh()
+hs.step(svc_pin, "svcG", fg)
+hs.step(svc_pin, "svcG", fg)
+ok(hs.pending["svcG"]["arg"] == "outlet-7" and "ignored" not in hs.alerts[0], "a well-formed pinned arg is kept")
+
+print("== 26. first_failed_at marks the incident start and survives re-pages ==")
+hs = fresh()
+hs.state["keys"].pop("svcA", None)          # earlier groups left svcA on disk
+t0 = sh.iso(clock.t)
+hs.step(SVC_IMMEDIATE, "svcA", fp)          # 1/2, absorbing
+rec = hs.state["keys"]["svcA"]
+ok(rec.get("first_failed_at") == t0, "set on the first failing cycle, before the threshold")
+clock.advance(61)
+hs.step(SVC_IMMEDIATE, "svcA", fp)          # confirmed -> page
+t_page1 = rec["last_transition"]
+clock.advance(61)
+hs.step(SVC_IMMEDIATE, "svcA", fp)          # realert due -> re-page
+ok(len(hs.alerts) == 2 and t_page1 != rec["last_transition"] == sh.iso(clock.t),
+   "re-page moved last_transition")
+ok(rec["first_failed_at"] == t0, "first_failed_at did not move")
+hs.step(SVC_IMMEDIATE, "svcA", None)
+ok("first_failed_at" not in rec, "cleared when the key steps healthy")
+ok("first_failed_at" not in sh.default_record(), "not in default_record: old state files load unchanged")
 
 print(f"\nALL {PASS} ASSERTIONS PASSED")
 shutil.rmtree(tmp)

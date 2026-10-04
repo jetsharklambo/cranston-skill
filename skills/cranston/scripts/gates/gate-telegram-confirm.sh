@@ -11,18 +11,37 @@
 #   GATE_TG_CHAT_ID="123456789"         # the ADMIN's numeric chat id (pinned)
 # Then set "approval_gate": "gates/gate-telegram-confirm.sh" in services.json.
 #
-# Contract: references/approval-gates.md (argv pass-through, exit 65 refusal).
+# Contract: references/approval-gates.md - argv pass-through: <script> plus at
+# most ONE argument of shape [A-Za-z0-9][A-Za-z0-9._@:-]{0,63}; anything else
+# exits 65 like a refusal. The prompt names the FULL script path.
 # Env knobs: GATE_TELEGRAM_ENV (creds file), GATE_TIMEOUT (seconds, default
 # 120), GATE_TG_API (test override for the Bot API base URL).
 set -u
 
 AUDIT="${SELFHEAL_AUDIT_LOG:-/dev/null}"
 SCRIPT="${1:-}"
-ARGSUMMARY="$(basename "${SCRIPT:-?}") ${2:-}"
+# Audit/prompt text. Until the argv is validated below this is the caller's raw
+# input, control characters stripped, so a refused argument cannot forge audit lines.
+ARGSUMMARY="$(printf '%s' "${1:-?} ${2:-}" | LC_ALL=C tr -d '\000-\037\177')"
 audit() { echo "$(date -u +%Y-%m-%dT%H:%M:%SZ) $*" >> "$AUDIT" 2>/dev/null || true; }
 refuse() { audit "GATE-REFUSED reason=\"$1\" argv=$ARGSUMMARY"; echo "gate: $1"; exit 65; }
 
+# Argv shape (defense in depth - the engine checks the same, never trust the
+# caller): <script> plus at most ONE [A-Za-z0-9][A-Za-z0-9._@:-]{0,63}.
+valid_arg() {
+    case "$1" in ""|*[[:space:]]*) return 1 ;; esac   # one line, or grep -q matches the first
+    printf '%s\n' "$1" | LC_ALL=C grep -Eq '^[A-Za-z0-9][A-Za-z0-9._@:-]{0,63}$'
+}
+[ $# -eq 1 ] || [ $# -eq 2 ] || refuse "expected <script> [one arg], got $# arguments"
+[ $# -eq 1 ] || valid_arg "$2" || refuse "malformed remediation argument"
 [ -n "$SCRIPT" ] && [ -f "$SCRIPT" ] || refuse "no such remediation script: '${SCRIPT}'"
+# Full resolved path: an approver shown "restart.sh" cannot tell
+# /opt/cranston/remediations/restart.sh from /tmp/restart.sh.
+DIR="$(cd "$(dirname "$SCRIPT")" 2>/dev/null && pwd)" && [ -n "$DIR" ] \
+    || refuse "cannot resolve the directory of '${SCRIPT}'"
+SCRIPT="$DIR/$(basename "$SCRIPT")"
+set -- "$SCRIPT" ${2:+"$2"}      # from here on "$@" is the validated, resolved argv
+ARGSUMMARY="$*"
 
 under_remediations() {
     [ -n "${SELFHEAL_ROOT:-}" ] || return 1
@@ -59,7 +78,8 @@ except Exception:
 
 SENT=$(curl -s -m 10 -X POST "$API/sendMessage" \
     --data-urlencode "chat_id=${GATE_TG_CHAT_ID}" \
-    --data-urlencode "text=🔐 Approve remediation: ${ARGSUMMARY}?
+    --data-urlencode "text=🔐 Approve remediation?
+${ARGSUMMARY}
 Reply within ${TIMEOUT}s with:  approve ${NONCE}
 Reply 'deny ${NONCE}' (or ignore) to refuse.")
 echo "$SENT" | grep -q '"ok": *true' || refuse "could not send the confirmation prompt (Bot API unreachable?)"
