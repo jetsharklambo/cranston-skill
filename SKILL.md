@@ -68,7 +68,6 @@ is not, and batches the rest into one daily digest.
 | Failure-mode audit library (F1–F20) | `{baseDir}/references/failure-modes.md` |
 | House doctrine template | `{baseDir}/references/doctrine.md` |
 | Hardware guidance | `{baseDir}/references/hardware.md` |
-| Onboarding methodology (placeholder) | `{baseDir}/references/methodology.md` |
 | Live state (per deployment) | `<deploy-root>/state/state.json`, `pending-approvals.json`, `audit.log` |
 
 ## Inputs

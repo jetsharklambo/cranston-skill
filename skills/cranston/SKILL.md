@@ -60,7 +60,6 @@ is not, and batches the rest into one daily digest.
 | Failure-mode audit library (F1–F20) | `${HERMES_SKILL_DIR}/references/failure-modes.md` |
 | House doctrine template | `${HERMES_SKILL_DIR}/references/doctrine.md` |
 | Hardware guidance | `${HERMES_SKILL_DIR}/references/hardware.md` |
-| Onboarding methodology (placeholder) | `${HERMES_SKILL_DIR}/references/methodology.md` |
 | Live state (per deployment) | `<deploy-root>/state/state.json`, `pending-approvals.json`, `audit.log` |
 
 ## Inputs

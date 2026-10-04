@@ -13,9 +13,20 @@ jobs:
 
       - name: Build is deterministic and views are not hand-edited
         run: |
-          python3 tools/build.py
-          git diff --exit-code || { echo "::error::generated views drifted - run tools/build.py and commit"; exit 1; }
+          # Order matters: check_drift.py compares a fresh in-memory build with
+          # the views on disk, so it must run against the COMMITTED views, before
+          # build.py rewrites them (afterwards it would always pass).
           python3 tools/check_drift.py
+          python3 tools/build.py
+          # On a committed tree the build must be a no-op. `git status --porcelain`
+          # also lists untracked files, which `git diff` ignores (e.g. a new
+          # authoring/ file whose generated copies were never added).
+          drift="$(git status --porcelain)"
+          if [ -n "$drift" ]; then
+            echo "$drift"
+            echo "::error::generated views are out of sync with authoring/ - run 'python3 tools/build.py' and commit the result (including new files)"
+            exit 1
+          fi
 
       - name: Every bundled file is referenced from SKILL.md
         run: python3 tools/validate_links.py

@@ -293,17 +293,49 @@ print("== retire: a device failing for a week ranks first ==")
 state_dir = DEPLOY / "state"
 state_dir.mkdir(exist_ok=True)
 old = (datetime.now(timezone.utc) - timedelta(days=9)).strftime("%Y-%m-%dT%H:%M:%SZ")
+recent = (datetime.now(timezone.utc) - timedelta(hours=1)).strftime("%Y-%m-%dT%H:%M:%SZ")
 (state_dir / "state.json").write_text(json.dumps({"keys": {
+    # the incident began 9 days ago; the hourly re-page moved last_transition an hour ago
     "box-disk": {"status": "awaiting_approval", "consecutive_failures": 9, "last_status_code": "VOLUME_ABSENT",
-                 "attempts": [], "last_alert": old, "last_transition": old}}}))
+                 "attempts": [], "last_alert": recent, "last_transition": recent, "first_failed_at": old},
+    # an older engine's record: a 9-day-old last_transition and no first_failed_at proves nothing
+    "nas": {"status": "awaiting_approval", "consecutive_failures": 9, "last_status_code": "PORT_CLOSED",
+            "attempts": [], "last_alert": old, "last_transition": old}}}))
 plan = json.loads(run("plan", "--json").stdout)
+names = [p["device"] for p in plan]
 ok(plan[0]["device"] == "box-disk" and plan[0]["open"][0] == "retire", "retire comes first for a long-failing device", plan[0])
 ok(any("failing now" in w for w in plan[0]["why"]), "live trouble is the stated reason")
+ok(f"down since {old[:10]} with nothing done" in plan[0]["why"],
+   "the why dates the incident from first_failed_at, not the re-paged last_transition", plan[0]["why"])
+ok("nas" in names and "retire" not in plan[names.index("nas")]["open"]
+   and not any("down since" in w for w in plan[names.index("nas")]["why"]),
+   "no first_failed_at -> no retire question, however old last_transition is", plan[names.index("nas")])
+ok(run("answer", "nas", "retire", "keep", expect=2).returncode == 2, "...and a retire answer for it is refused as not applicable")
 q = json.loads(run("next", "--json").stdout)
 ok(q["kind"] == "retire" and "VOLUME_ABSENT" in q["ask"], "the retire question names the live finding")
+ok(f"since {old[:10]}" in q["ask"], "the retire question dates the incident from first_failed_at", q["ask"])
 run("answer", "box-disk", "retire", "retire — that drive is gone")
 run("fill", "--apply")
 ok(svc("box-disk")["enabled"] is False, "retire=retire -> enabled: false")
+
+print("== retire=keep: a doctrine-only decision, recorded once ==")
+(state_dir / "state.json").write_text(json.dumps({"keys": {
+    "charger": {"status": "awaiting_approval", "consecutive_failures": 9, "last_status_code": "VALUE_LOW",
+                "attempts": [], "last_alert": recent, "last_transition": recent, "first_failed_at": old}}}))
+q = json.loads(run("next", "--device", "charger", "--json").stdout)
+ok(q["kind"] == "retire", "a second long incident gets its own retire question", q)
+run("answer", "charger", "retire", "keep — it's unplugged for the winter, not gone")
+r = run("fill", "--apply")
+ok("applied" in r.stdout and svc("charger")["_interview"]["doctrine.retire"]["value"] == "keep",
+   "retire=keep is recorded as a doctrine-only decision", r.stdout)
+ok(svc("charger").get("enabled", True) is True, "retire=keep leaves the device enabled")
+backups = sorted(p.name for p in DEPLOY.glob("services.json.backup-*"))
+before = CFG.read_text()
+r = run("fill", "--apply")
+ok("nothing to fill" in r.stdout and "applied" not in r.stdout,
+   "a second fill --apply after retire=keep has nothing to do", r.stdout)
+ok(sorted(p.name for p in DEPLOY.glob("services.json.backup-*")) == backups, "...and makes no second backup")
+ok(CFG.read_text() == before, "...and leaves services.json byte-identical")
 
 print("== doctrine draft quotes the admin ==")
 r = run("doctrine")
@@ -315,7 +347,7 @@ print("== digest delivery of one question is opt-in and lock-safe ==")
 digest = DEPLOY / "state" / "digest.jsonl"
 run("next", "--digest", str(digest))
 line = json.loads(digest.read_text().splitlines()[-1])
-ok(line["system"] == "interview" and ":class)" in line["message"] or ":how)" in line["message"],
+ok(line["system"] == "interview" and (":class)" in line["message"] or ":how)" in line["message"]),
    "the digest line carries the question id and text", line)
 
 shutil.rmtree(tmp, ignore_errors=True)

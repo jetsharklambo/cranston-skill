@@ -119,8 +119,8 @@ agent may act.
 | `check-lan-inventory.sh` | IP/MAC fingerprint watch (DHCP drift vs host down) |
 
 All targets and thresholds come from the service's `params` block — see
-`config/services.schema.md` for the contract and `examples/cranston/` for a
-12-service real-world configuration.
+`references/services.schema.md` for the contract and
+`references/example-cranston/` for a 12-service real-world configuration.
 
 ## Prerequisites: the always-on box
 

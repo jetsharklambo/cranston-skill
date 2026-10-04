@@ -283,16 +283,25 @@ class Device:
 
     def _live(self):
         """What the engine's state says right now: failing keys, pending asks,
-        and how long the root key has been bad."""
+        and when the root key's current incident began (`since`).
+
+        `since` is the record's `first_failed_at`: the engine sets it on the
+        first failing cycle, never moves it while the incident lasts, and drops
+        it when the key returns to ok. `last_transition` is NOT a substitute -
+        every re-page of an awaiting_approval key moves it (hourly by default),
+        so an incident measured from it never looks a week old. A record
+        without `first_failed_at` (state written by an older engine) has no
+        `since`, and the retire question does not apply to it."""
         keys = {k: v for k, v in self.dep.state.items()
                 if k == self.name or k.startswith(self.name + "/")}
         bad = {k: v for k, v in keys.items() if v.get("status") != "ok"}
         pending = [k for k in self.dep.pending if k == self.name or k.startswith(self.name + "/")]
         since = None
         root = keys.get(self.name)
-        if root and root.get("status") in ("awaiting_approval", "escalated", "failing"):
+        if (root and root.get("status") in ("awaiting_approval", "escalated", "failing")
+                and root.get("first_failed_at")):
             try:
-                since = parse_iso(root["last_transition"])
+                since = parse_iso(root["first_failed_at"])
             except Exception:
                 since = None
         return {"bad": bad, "pending": pending, "since": since}
@@ -567,7 +576,8 @@ def plan_device(dev):
     # retire ------------------------------------------------------------------
     if dev.ans("retire") == "retire":
         want("enabled", False, "retire=retire")
-    elif dev.ans("retire") == "keep":
+    elif dev.ans("retire") == "keep" and dev.is_open("doctrine.retire"):
+        # doctrine-only, like drill: recorded once, so a later fill has nothing to do
         changes.append(Change("_interview.doctrine.retire", None, "keep", "retire=keep", False))
 
     # class / how -------------------------------------------------------------
