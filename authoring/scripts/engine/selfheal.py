@@ -447,6 +447,8 @@ class SelfHeal:
         if not self.alerts:
             return
         env = dict(os.environ)
+        # an inherited announce-channel marker must not misroute real pages
+        env.pop("SELFHEAL_ALERT_CHANNEL", None)
         env.update(self.engine_exports())
         try:
             r = subprocess.run(self.alert_sink + self.alerts, capture_output=True, text=True,
@@ -473,6 +475,35 @@ class SelfHeal:
             for rec, _message, prev in reversed(self.pages):
                 rec["last_alert"] = prev
         self.alerts, self.pages = [], []
+
+    def announce_fix(self, key, remediation, script):
+        """Consent pre-announcement for a dict-auto remediation: when its
+        consent scope is household or named:*, hand the sink ONE extra line
+        with SELFHEAL_ALERT_CHANNEL=announce in its env before the fix runs,
+        so the people it disturbs hear about it first. The sink only queues
+        the line; any announce failure is logged and the fix proceeds - the
+        announcement must never block or veto a remediation."""
+        if not isinstance(remediation, dict):
+            return
+        consent = str(remediation.get("consent") or "")
+        if consent != "household" and not consent.startswith("named:"):
+            return
+        text = remediation.get("announce") or (
+            f"Heads-up: fixing {key} now ({Path(script).name}) — "
+            f"it may be briefly unavailable.")
+        env = dict(os.environ)
+        env.update(self.engine_exports())
+        env["SELFHEAL_ALERT_CHANNEL"] = "announce"
+        try:
+            r = subprocess.run(self.alert_sink + [text], capture_output=True,
+                               text=True, errors="replace", timeout=30,
+                               check=False, env=env)
+            if r.returncode != 0:
+                log(f"WARN: announce sink failed (rc={r.returncode}); "
+                    f"continuing with the fix")
+        except Exception as e:
+            log(f"WARN: announce sink failed ({type(e).__name__}: {e}); "
+                f"continuing with the fix")
 
     def notify_class(self, svc, code, degraded, has_ask):
         """'immediate' or 'digest' for a finding. Ask-first findings are always
@@ -533,7 +564,7 @@ class SelfHeal:
 
     # -- pending approvals ----------------------------------------------------
 
-    def add_pending(self, key, code, script, arg, consent=None):
+    def add_pending(self, key, code, script, arg, consent=None, announce=None):
         self.pending[key] = {
             "status_code": code,
             "script": str(resolve(script)),
@@ -542,6 +573,10 @@ class SelfHeal:
             "created": iso(now()),
             "expires": iso(now() + timedelta(hours=self.pending_ttl_hours)),
         }
+        if announce:
+            # approve-heal replays this through the sink's announce channel
+            # just before the approved fix runs (consent pre-announcement)
+            self.pending[key]["announce"] = announce
 
     # -- state machine --------------------------------------------------------
 
@@ -612,6 +647,14 @@ class SelfHeal:
             self.run_hook(svc, "on_fail_forensics")
 
         remediation = svc.get("remediations", {}).get(code, None)
+        # Three remediation forms: a plain string (auto), {"ask": ...}
+        # (human-approved - a dict with "ask" keeps that behavior), and the
+        # dict-auto form {"auto": ..., "consent": ..., "announce": ...},
+        # which runs exactly like a string auto but carries a consent scope
+        # and an optional pre-announcement text (announce_fix).
+        auto_dict = (remediation if isinstance(remediation, dict)
+                     and "auto" in remediation and "ask" not in remediation else None)
+        auto_script = remediation if isinstance(remediation, str) else (auto_dict or {}).get("auto")
         detail = finding.get("detail", "")
         layer = finding.get("layer", "?")
         arg = key.split("/", 1)[1] if "/" in key else None
@@ -628,16 +671,18 @@ class SelfHeal:
                 # pending_ttl_hours; a re-nag that keeps saying "reply 'heal'"
                 # must renew it or the reply lands on "Nothing pending". Same
                 # script and argument the cap proposed (the code's auto fix).
-                if isinstance(remediation, str):
-                    self.add_pending(key, code, remediation, arg)
+                if auto_script:
+                    self.add_pending(key, code, auto_script, arg,
+                                     consent=(auto_dict or {}).get("consent"),
+                                     announce=(auto_dict or {}).get("announce"))
                 route = self.demote_ask(rec, svc, code, "immediate")
                 self.alert(rec, f"\U0001f6a8 {key} STILL DOWN ({code}) — auto-restart cap "
                                 f"reached earlier. Reply 'heal {key}' to run the fix."
                                 f"{self.flap_suffix(rec)}", route=route, system=key)
             return
 
-        if isinstance(remediation, str):
-            self.step_auto(svc, key, rec, code, layer, detail, remediation, arg)
+        if auto_script:
+            self.step_auto(svc, key, rec, code, layer, detail, auto_script, arg, auto_dict)
         else:
             ask_script = remediation.get("ask") if isinstance(remediation, dict) else None
             # An ask-first entry may pin a fixed argument for its script so one
@@ -670,7 +715,8 @@ class SelfHeal:
                         scope = f" This affects {who} — give them a heads-up."
                     proposal = (f"Proposed fix: {Path(ask_script).name} (ask-first){pinned_note}. "
                                 f"Reply 'heal {key}' to approve.{scope}")
-                    self.add_pending(key, code, ask_script, arg, consent)
+                    self.add_pending(key, code, ask_script, arg, consent,
+                                     announce=remediation.get("announce"))
                 else:
                     proposal = "No safe automatic fix known — manual intervention needed."
                 route = self.notify_class(svc, code, degraded, bool(ask_script))
@@ -682,7 +728,9 @@ class SelfHeal:
                 rec["status"] = "awaiting_approval"
                 rec["last_transition"] = iso(now())
 
-    def step_auto(self, svc, key, rec, code, layer, detail, script, arg):
+    def step_auto(self, svc, key, rec, code, layer, detail, script, arg, remediation=None):
+        """remediation is the dict-auto form when the auto fix came as one
+        ({"auto": ..., "consent": ..., "announce": ...}), else None."""
         window = timedelta(hours=self.opt(svc, "attempt_window_hours"))
         rec["attempts"] = [a for a in rec["attempts"] if now() - parse_iso(a) < window]
         max_attempts = self.opt(svc, "max_attempts")
@@ -690,7 +738,9 @@ class SelfHeal:
         if len(rec["attempts"]) >= max_attempts:
             rec["status"] = "escalated"
             rec["last_transition"] = iso(now())
-            self.add_pending(key, code, script, arg)
+            self.add_pending(key, code, script, arg,
+                             consent=(remediation or {}).get("consent"),
+                             announce=(remediation or {}).get("announce"))
             # realert-gated: during a flap storm a key can re-escalate every
             # few minutes (attempt history survives recoveries by design); the
             # escalated branch re-nags STILL DOWN on the same schedule anyway.
@@ -711,8 +761,16 @@ class SelfHeal:
         rec["attempts"].append(iso(now()))
         attempt_n = len(rec["attempts"])
         log(f"{key}: {code} -> running {Path(script).name} (attempt {attempt_n}/{max_attempts})")
+        # consent pre-announcement (dict-auto form only): tell the people
+        # this fix disturbs before it runs; never blocks or vetoes the fix
+        self.announce_fix(key, remediation, script)
         rc, output = self.run_remediation(svc, script, arg)
 
+        # Inline sleep per ATTEMPTED remediation, by design: attempts are
+        # bounded by cooldown_minutes/max_attempts, and the cron wrapper's
+        # flock -n makes an overrun cycle skip the next one rather than
+        # overlap it. A stretched cycle here is the accepted cost of an
+        # honest verify.
         time.sleep(self.opt(svc, "verify_delay_seconds"))
         still_failing = key in self.run_check(svc)
 
@@ -876,6 +934,13 @@ def main():
         except BlockingIOError:
             log("another selfheal instance holds the lock; exiting")
             return 0
+        # The lock serializes state-file reads/writes, not remediation runs:
+        # approve-heal holds it only around its own load/save phases.
+        # __init__ read state/pending BEFORE this flock succeeded, so re-read
+        # both under the lock - an approve-heal save in that window would
+        # otherwise be overwritten by the stale copies.
+        sh.state = load_json(sh.state_file, {"keys": {}})
+        sh.pending = load_json(sh.pending_file, {})
         sh.run()
     return 0
 

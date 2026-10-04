@@ -14,9 +14,12 @@ passed to the gate as the GATE_CODE env var; it is never written to the audit
 log or state.
 
 Looks up the pending-approval entry recorded by selfheal.py, runs the recorded
-remediation, re-runs the service's health check to verify (catching the verify
-timeout - a v1 debt), prints a human-readable result for the agent to relay
-verbatim, and clears the pending entry + escalated state.
+remediation, re-runs the service's health check to verify (any verify failure
+collapses to an "unverified" verdict - it can never eat the result), prints a
+human-readable result for the agent to relay verbatim, and clears the pending
+entry + escalated state. The state lock is held only around the state-file
+reads/writes (two short phases), never across the remediation run, so the
+engine's monitor cycles keep running while a fix is in flight.
 """
 
 import fcntl
@@ -35,6 +38,15 @@ ROOT = BASE.parent
 # A pending entry's argument is a finding subkey or a pinned arg: no leading
 # '-', no slash, no whitespace, max 64 chars. Keep identical to selfheal.py.
 ARG_RE = r"[A-Za-z0-9][A-Za-z0-9._@:-]{0,63}"
+# A service key is <name> or <name>/<subkey> - the same shape selfheal.py's
+# valid_finding accepts, so every key the engine can create is approvable
+# here (subkeys may carry '@' and ':', e.g. a host:port) and nothing else is
+# (one slash at most; a second slash never names an engine key).
+KEY_RE = re.compile(r"[A-Za-z0-9_.-]+(?:/" + ARG_RE + r")?")
+# Verify-step fallbacks when neither the service nor the config's "defaults"
+# block sets them. Keep identical to selfheal.py's ENGINE_DEFAULTS (this
+# script is standalone by design - no selfheal import).
+VERIFY_DEFAULTS = {"verify_delay_seconds": 45, "check_timeout_seconds": 45}
 # Names a service's params block may NOT set (engine-owned markers, the gate's
 # second factor, PATH-like names). Keep identical to selfheal.py's copy.
 RESERVED_PARAM_RE = r"^(SELFHEAL_|GATE_|LD_|BASH_|PYTHON|SHELLOPTS$|PATH$|ENV$|CDPATH$|IFS$|HOME$)"
@@ -60,10 +72,22 @@ def resolve(p):
 
 
 def load(path, default):
+    """Mirror selfheal.py's load_json: a missing file is the default; a
+    CORRUPT file is moved aside and the default returned (silently treating
+    a corrupt pending/state file as empty erased approvals and history)."""
     try:
         with open(path) as f:
             return json.load(f)
-    except Exception:
+    except FileNotFoundError:
+        return default
+    except Exception as e:
+        aside = path.with_suffix(
+            path.suffix + f".corrupt-{datetime.now(timezone.utc).strftime('%Y%m%d%H%M%S')}")
+        try:
+            os.replace(path, aside)
+            print(f"(warning: {path.name} corrupt ({e}); moved aside to {aside.name})")
+        except OSError:
+            pass
         return default
 
 
@@ -124,7 +148,7 @@ def argvify(v):
 
 
 def main():
-    if len(sys.argv) not in (2, 3) or not re.fullmatch(r"[A-Za-z0-9/_.-]+", sys.argv[1]):
+    if len(sys.argv) not in (2, 3) or not KEY_RE.fullmatch(sys.argv[1]):
         print("Usage: approve-heal.py <service-key> [code]")
         return 64
     key = sys.argv[1]
@@ -143,6 +167,12 @@ def main():
     audit_log = resolve(paths.get("audit_log", "state/audit.log"))
 
     state_dir.mkdir(parents=True, exist_ok=True)
+
+    # -- phase 1 (LOCKED): resolve + validate the pending entry, audit the
+    # intent, then RELEASE the lock. The lock serializes state-file reads
+    # and writes ONLY - never the remediation run itself: holding it through
+    # gate + remediation + verify (minutes, worst case) made selfheal.py's
+    # non-blocking flock skip whole monitor cycles.
     with open(lock_file, "w") as lock:
         fcntl.flock(lock, fcntl.LOCK_EX)
 
@@ -189,64 +219,130 @@ def main():
         with open(audit_log, "a") as f:
             f.write(f"{now_iso()} ts={int(time.time())} APPROVED-EXEC service={key} "
                     f"script={script} arg={arg or ''} caller=approve-heal\n")
+    # lock released: the engine's cycles run freely while the fix does
 
-        # Human-approved runs go through the deployment's approval gate when
-        # one is configured. The gate distinguishes this caller from the
-        # engine's auto path by SELFHEAL_CALLER=approve-heal and the ABSENCE
-        # of SELFHEAL_AUTOMATION, and may demand a second factor; GATE_CODE
-        # carries one supplied with the approval. Budget is 300s here (vs the
-        # engine's 180s) so an interactive gate has room for the human.
-        gate = argvify(config.get("paths", {}).get("approval_gate"))
-        cmd = (gate or ["bash"]) + [str(resolve(script))] + ([str(arg)] if arg else [])
-        env = svc_env(svc, state_dir, audit_log)
-        if gate_code:
-            env["GATE_CODE"] = gate_code
+    # -- UNLOCKED: announce, gate + remediation, verify.
+    # Consent pre-announcement: a household/named-consent fix tells the
+    # people it disturbs BEFORE it runs - one extra sink invocation on the
+    # 'announce' channel. The sink only queues the line; an announce failure
+    # never blocks or vetoes the fix.
+    consent = str(entry.get("consent") or "")
+    if consent == "household" or consent.startswith("named:"):
+        text = entry.get("announce") or (
+            f"Heads-up: fixing {key} now ({Path(script).name}) — "
+            f"it may be briefly unavailable.")
+        sink = argvify(paths.get("alert_sink", "bin/send-alert.sh"))
+        a_env = svc_env(svc, state_dir, audit_log)
+        a_env["SELFHEAL_ALERT_CHANNEL"] = "announce"
         try:
-            r = subprocess.run(cmd, capture_output=True, text=True, timeout=300,
-                               env=env)
-        except subprocess.TimeoutExpired:
-            print(f"❌ {Path(script).name} timed out after 300s "
-                  f"(gate included). State unchanged.")
-            return 1
-        if r.returncode == 65:
-            out = (r.stdout + r.stderr).strip()
-            print(f"⛔ approval gate refused: {out[-300:] or 'no reason given'}. "
-                  f"The pending approval is kept - retry with a valid factor.")
-            return 1
+            a = subprocess.run(sink + [text], capture_output=True, text=True,
+                               timeout=30, env=a_env)
+            if a.returncode != 0:
+                print(f"(note: announce sink failed rc={a.returncode}; continuing)")
+        except Exception as e:
+            print(f"(note: announce sink failed ({type(e).__name__}); continuing)")
+
+    # Human-approved runs go through the deployment's approval gate when
+    # one is configured. The gate distinguishes this caller from the
+    # engine's auto path by SELFHEAL_CALLER=approve-heal and the ABSENCE
+    # of SELFHEAL_AUTOMATION, and may demand a second factor; GATE_CODE
+    # carries one supplied with the approval. Budget is 300s here (vs the
+    # engine's 180s) so an interactive gate has room for the human.
+    gate = argvify(paths.get("approval_gate"))
+    cmd = (gate or ["bash"]) + [str(resolve(script))] + ([str(arg)] if arg else [])
+    env = svc_env(svc, state_dir, audit_log)
+    if gate_code:
+        env["GATE_CODE"] = gate_code
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=300,
+                           env=env)
+    except subprocess.TimeoutExpired:
+        print(f"❌ {Path(script).name} timed out after 300s "
+              f"(gate included). State unchanged.")
+        return 1
+    if r.returncode == 65:
         out = (r.stdout + r.stderr).strip()
-        if r.returncode == 75:
-            print(f"⛔ {Path(script).name} refused: internal rate cap. {out}")
-            return 1
-        if r.returncode != 0:
-            print(f"❌ {Path(script).name} failed (exit {r.returncode}): {out[-300:]}")
-            return 1
+        print(f"⛔ approval gate refused: {out[-300:] or 'no reason given'}. "
+              f"The pending approval is kept - retry with a valid factor.")
+        return 1
+    out = (r.stdout + r.stderr).strip()
+    if r.returncode == 75:
+        print(f"⛔ {Path(script).name} refused: internal rate cap. {out}")
+        return 1
+    if r.returncode != 0:
+        print(f"❌ {Path(script).name} failed (exit {r.returncode}): {out[-300:]}")
+        return 1
 
-        # verify: re-run the service's check. The verify timeout is CAUGHT
-        # (v1 debt: a slow check tracebacked here and the user got nothing).
-        verdict = "remediation ran, but no health check found to verify"
-        if svc:
+    # verify: re-run the service's check. From here on the remediation HAS
+    # run, so NOTHING may traceback past the cleanup below: a missing check,
+    # garbage output or any verify error (v1 debt: a slow check tracebacked
+    # here, the user got nothing, and the pending entry was never cleared)
+    # collapses to an "unverified" verdict instead.
+    verdict = "remediation ran, but no health check found to verify"
+    if svc and svc.get("check"):
+        try:
             delay = svc.get("verify_delay_seconds",
-                            config.get("defaults", {}).get("verify_delay_seconds", 45))
+                            config.get("defaults", {}).get(
+                                "verify_delay_seconds", VERIFY_DEFAULTS["verify_delay_seconds"]))
             time.sleep(delay)
-            try:
-                chk = subprocess.run(["bash", str(resolve(svc["check"]))],
-                                     capture_output=True, text=True,
-                                     timeout=svc.get("check_timeout_seconds",
-                                                     config.get("defaults", {}).get("check_timeout_seconds", 45)) + 15,
-                                     env=svc_env(svc, state_dir, audit_log))
-                still = any(json.loads(l).get("key") == key
-                            for l in chk.stdout.splitlines() if l.strip().startswith("{"))
-                verdict = ("verified HEALTHY ✅" if chk.returncode == 0 or not still
-                           else "still UNHEALTHY after remediation ⚠️ — may need manual attention")
-            except subprocess.TimeoutExpired:
-                verdict = ("remediation ran but the verify check timed out — "
+            chk = subprocess.run(["bash", str(resolve(svc["check"]))],
+                                 capture_output=True, text=True,
+                                 timeout=svc.get("check_timeout_seconds",
+                                                 config.get("defaults", {}).get(
+                                                     "check_timeout_seconds",
+                                                     VERIFY_DEFAULTS["check_timeout_seconds"])) + 15,
+                                 env=svc_env(svc, state_dir, audit_log))
+            # parse per-line like selfheal.run_check: a malformed line is
+            # skipped, never a traceback
+            findings_seen, still = 0, False
+            for l in chk.stdout.splitlines():
+                l = l.strip()
+                if not l.startswith("{"):
+                    continue
+                try:
+                    f = json.loads(l)
+                except Exception:
+                    continue
+                if isinstance(f, dict) and "key" in f:
+                    findings_seen += 1
+                    if f.get("key") == key:
+                        still = True
+            if chk.returncode == 0:
+                verdict = "verified HEALTHY ✅"
+            elif still:
+                verdict = "still UNHEALTHY after remediation ⚠️ — may need manual attention"
+            elif findings_seen:
+                verdict = "verified HEALTHY ✅"   # check failing on OTHER keys only
+            else:
+                verdict = ("remediation ran but the verify output was unreadable — "
                            "treat as unverified and watch the next monitor cycle")
+        except subprocess.TimeoutExpired:
+            verdict = ("remediation ran but the verify check timed out — "
+                       "treat as unverified and watch the next monitor cycle")
+        except Exception as e:
+            verdict = (f"remediation ran but the verify step errored ({type(e).__name__}) — "
+                       f"treat as unverified and watch the next monitor cycle")
 
-        del pending[key]
+    # The remediation ran: the outcome is ALWAYS audited and the pending
+    # entry ALWAYS cleared, whatever the verify step managed.
+    verdict_word = ("ok" if "HEALTHY ✅" in verdict
+                    else "unhealthy" if "UNHEALTHY" in verdict else "unverified")
+    with open(audit_log, "a") as f:
+        f.write(f"{now_iso()} ts={int(time.time())} APPROVED-RESULT service={key} "
+                f"script={Path(script).name} verdict={verdict_word}\n")
+
+    # -- phase 2 (LOCKED): re-read both files fresh - the engine may have
+    # renewed the pending entry or rewritten state while the fix ran - then
+    # pop/update only this key and save.
+    with open(lock_file, "w") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        pending = load(pending_file, {})
+        pending.pop(key, None)
         save(pending_file, pending)
         state = load(state_file, {"keys": {}})
-        rec = state["keys"].get(key)
-        if rec:
+        rec = state.get("keys", {}).get(key)
+        if isinstance(rec, dict):
+            state.setdefault("keys", {})[key] = rec
             rec["status"] = "ok" if "HEALTHY ✅" in verdict else "failing"
             rec["consecutive_failures"] = 0
             rec["last_transition"] = now_iso()
@@ -254,8 +350,8 @@ def main():
                 rec.pop("first_failed_at", None)  # the incident is over
             save(state_file, state)
 
-        print(f"🔧 Approved heal for {key}: {Path(script).name} completed, {verdict}")
-        return 0
+    print(f"🔧 Approved heal for {key}: {Path(script).name} completed, {verdict}")
+    return 0
 
 
 if __name__ == "__main__":

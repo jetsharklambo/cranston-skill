@@ -47,6 +47,10 @@ dependencies:
       mode: soft
       prompt: Telegram chat id for alerts
       required_for: the bundled Telegram sender bin/send-telegram.sh (the default delivery path); any alert sink command works
+    - name: TG_ANNOUNCE_CHAT_ID
+      mode: soft
+      prompt: Telegram chat id for household pre-announcements (optional second chat)
+      required_for: routing consent pre-announcements to a shared chat via bin/notify-alerts.sh; unset means announcements go to the admin chat
 
 hermes:
   tags:

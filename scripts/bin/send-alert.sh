@@ -16,6 +16,11 @@
 # worst day ever was 530 deliveries from a looping sender; storm days repeat
 # one text.
 #
+# Channels: with SELFHEAL_ALERT_CHANNEL=announce each line is queued as the
+# object {"text": <line>, "channel": "announce"} instead of a plain string -
+# the drainer routes those to TG_ANNOUNCE_CHAT_ID (household announcements,
+# no alert header). Page lines stay plain strings; old queues are unchanged.
+#
 # SELFHEAL_ALERT_FILE must be the SAME value for the writer (the engine's cron
 # line, which runs this sink) and the drainer's cron line - two values are two
 # queues, one of them never drained. The default suits Linux; Termux has no
@@ -28,11 +33,13 @@ ALERT_FILE="${SELFHEAL_ALERT_FILE:-/tmp/selfheal-alert-pending.json}"
 
 [ $# -ge 1 ] || exit 0
 
-python3 - "$ALERT_FILE" "$@" <<'PY'
+python3 - "$ALERT_FILE" "${SELFHEAL_ALERT_CHANNEL:-}" "$@" <<'PY'
 import fcntl, json, os, sys
 from datetime import datetime, timezone
 
-path, new = sys.argv[1], sys.argv[2:]
+path, channel, new = sys.argv[1], sys.argv[2], sys.argv[3:]
+if channel == "announce":
+    new = [{"text": a, "channel": "announce"} for a in new]
 with open(path + ".lock", "w") as lk:
     fcntl.flock(lk, fcntl.LOCK_EX)
     alerts = []

@@ -36,7 +36,7 @@ new codes.
 
 ## Adapter gaps this example exposes (phase 3 work)
 
-Three of the four are shipped. The example's absolute `.../workspace/bin/`
+All four are shipped. The example's absolute `.../workspace/bin/`
 paths for the gate and the guard are the deployment's copies of the files
 named below.
 
@@ -69,8 +69,13 @@ named below.
    sent-text window (`<file>.sent.json`, `SELFHEAL_SENT_WINDOW_MINUTES`,
    default 30) because queue-side dedupe cannot see what was already
    delivered. This is the delivery reference for other adapters.
-4. **Consent routing — still open.** The engine now carries `consent` on
-   ask-first proposals ("This affects the household — give them a heads-up.");
-   the adapter's alert composer and any household-announce channel build on
-   it. Nothing shipped here consumes it yet: `notify-alerts.sh` relays the
-   engine's lines as they are.
+4. **Consent routing — shipped as the announce channel.** A remediation
+   entry (ask-first, or the auto-dict form) whose `consent` is `household`
+   or `named:<person>` gets its `announce` text (or a generated fallback)
+   queued through the alert sink with `SELFHEAL_ALERT_CHANNEL=announce` just
+   before the fix runs — the engine announces auto fixes, `approve-heal.py`
+   announces at approval time. `send-alert.sh` stores announce lines as
+   tagged objects beside the plain page strings; `notify-alerts.sh` delivers
+   them to `TG_ANNOUNCE_CHAT_ID` (a shared household chat) when set and folds
+   them into the admin page when not, so nothing is silently dropped. An
+   announce failure never blocks the fix.

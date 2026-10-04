@@ -32,6 +32,19 @@
 #                                 every run. Queue-side dedupe cannot see what was
 #                                 already delivered; the reference deployment's
 #                                 worst day was 530 deliveries of one looping text.
+#                                 The window applies to pages AND announcements,
+#                                 by text.
+#   TG_ANNOUNCE_CHAT_ID           optional - a second chat for household
+#                                 announcements. Entries send-alert.sh queued
+#                                 under SELFHEAL_ALERT_CHANNEL=announce (objects
+#                                 {"text": ..., "channel": "announce"}) are sent
+#                                 to this chat as the bare texts, no "N alerts"
+#                                 header, through the same sender with TG_CHAT_ID
+#                                 overridden in its environment. Pages go first;
+#                                 a failed announce send keeps only the announce
+#                                 entries queued (exit 1). UNSET: announce texts
+#                                 are folded into the page message and counted in
+#                                 its header, so nothing is silently dropped.
 #   SELFHEAL_LOG_FILE             optional - append one line per real action
 #
 # Locking is python fcntl on <file>.lock - the same lock send-alert.sh takes.
@@ -54,14 +67,16 @@ TMPD=$(mktemp -d) || exit 1
 trap 'rm -rf "$TMPD"' EXIT
 
 # Step 1 (under the lock): read, prune the sent window, drop within-window
-# repeats, compose. Leaves $TMPD/msg (the message), $TMPD/lines.json (exactly
-# the queue lines it contains) and $TMPD/log (status lines). No msg = nothing
-# to send. Exit 2 = the queue is not JSON; it is left in place for a human.
-python3 - "$ALERT_FILE" "$WINDOW" "$TMPD" <<'PY'
+# repeats, compose. Leaves $TMPD/msg + $TMPD/lines.json (the page message and
+# exactly the raw queue entries it covers) and, when the announce chat is set
+# (argv 4 non-empty), $TMPD/msg.ann + $TMPD/lines.ann.json for the announce
+# entries; with it unset, announce texts fold into the page message. No msg
+# files = nothing to send. Exit 2 = the queue is not JSON; left for a human.
+python3 - "$ALERT_FILE" "$WINDOW" "$TMPD" "${TG_ANNOUNCE_CHAT_ID:-}" <<'PY'
 import fcntl, json, os, sys
 from datetime import datetime, timedelta, timezone
 
-path, window, outdir = sys.argv[1], sys.argv[2], sys.argv[3]
+path, window, outdir, ann_chat = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4]
 sent_path = path + ".sent.json"
 FMT = "%Y-%m-%dT%H:%M:%SZ"
 # worst line decides the header; the needle for ⚠️ matches with or without
@@ -93,7 +108,19 @@ with open(path + ".lock", "w") as lk:
     except Exception as e:
         print(f"queue {path} is not valid JSON ({e}) - left in place", file=sys.stderr)
         sys.exit(2)
-    alerts = [a for a in alerts if isinstance(a, str) and a.strip()]
+    # normalize: a plain string is a page line; {"channel": "announce",
+    # "text": ...} is an announcement; any other dict with a text field pages
+    # too. Anything else is malformed and falls off on the next queue rewrite.
+    # Each entry keeps its RAW form paired with its text so removal in step 2
+    # stays exact.
+    entries = []
+    for a in alerts:
+        if isinstance(a, str) and a.strip():
+            entries.append((a, a, False))
+        elif isinstance(a, dict):
+            text = a.get("text")
+            if isinstance(text, str) and text.strip():
+                entries.append((a, text, a.get("channel") == "announce"))
 
     # the sent window: {text: iso-time}, pruned to entries younger than the window
     try:
@@ -114,32 +141,45 @@ with open(path + ".lock", "w") as lk:
     if recent != sent:
         write_json(sent_path, recent)
 
-    lines, dropped = [], 0
-    for a in alerts:
-        if a in recent:
+    kept, dropped, seen = [], 0, set()
+    for raw, text, is_ann in entries:
+        if text in recent:
             dropped += 1          # delivered within the window: noise, remove it
-        elif a not in lines:
-            lines.append(a)
+        elif text not in seen:
+            seen.add(text)
+            kept.append((raw, text, is_ann))
     if dropped:
         logs.append(f"dropped {dropped} within-window repeat(s) (window {window:g} min)")
-    if len(lines) != len(alerts):
-        # rewrite the queue without the dropped lines (delete it when empty)
-        if lines:
-            write_json(path, {"alerts": lines, "timestamp": now.strftime(FMT)})
+    if len(kept) != len(alerts):
+        # rewrite the queue without the dropped entries (delete it when empty)
+        if kept:
+            write_json(path, {"alerts": [r for r, _, _ in kept],
+                              "timestamp": now.strftime(FMT)})
         else:
             try:
                 os.remove(path)
             except FileNotFoundError:
                 pass
 
-if lines:
-    worst = next((shown for needle, shown in ORDER if any(needle in l for l in lines)), "")
-    head = f"Cranston: {len(lines)} alert" + ("s" if len(lines) != 1 else "")
+# announce chat unset: fold announce texts into the page message (counted in
+# its header) so nothing is silently dropped
+pages = [(r, t) for r, t, is_ann in kept if not is_ann or not ann_chat]
+anns = [(r, t) for r, t, is_ann in kept if is_ann and ann_chat]
+if pages:
+    texts = [t for _, t in pages]
+    worst = next((shown for needle, shown in ORDER if any(needle in t for t in texts)), "")
+    head = f"Cranston: {len(texts)} alert" + ("s" if len(texts) != 1 else "")
     head = f"{worst} {head}" if worst else head
     with open(os.path.join(outdir, "msg"), "w") as f:
-        f.write(head + "\n" + "\n".join(lines))
+        f.write(head + "\n" + "\n".join(texts))
     with open(os.path.join(outdir, "lines.json"), "w") as f:
-        json.dump(lines, f)
+        json.dump([r for r, _ in pages], f)
+if anns:
+    # for the household: plain language, no alert-count header
+    with open(os.path.join(outdir, "msg.ann"), "w") as f:
+        f.write("\n".join(t for _, t in anns))
+    with open(os.path.join(outdir, "lines.ann.json"), "w") as f:
+        json.dump([r for r, _ in anns], f)
 if logs:
     with open(os.path.join(outdir, "log"), "w") as f:
         f.write("\n".join(logs) + "\n")
@@ -150,27 +190,51 @@ if [ "$rc" -ne 0 ]; then
     logline "queue $ALERT_FILE unreadable (rc=$rc) - left in place, nothing sent"
     exit 1
 fi
-[ -s "$TMPD/msg" ] || exit 0
+if [ ! -s "$TMPD/msg" ] && [ ! -s "$TMPD/msg.ann" ]; then exit 0; fi
 
-MESSAGE=$(cat "$TMPD/msg")
-ERR=$("$NOTIFY" "$MESSAGE" 2>&1 >/dev/null); rc=$?
-if [ "$rc" -ne 0 ]; then
-    ERR=$(printf '%s' "$ERR" | tr '\n' ' ' | cut -c1-300)
-    logline "send FAILED rc=$rc via $NOTIFY: ${ERR:-no output} - queue kept"
-    exit 1
+# the page goes first: a failed page send keeps the whole queue and exits 1
+if [ -s "$TMPD/msg" ]; then
+    MESSAGE=$(cat "$TMPD/msg")
+    ERR=$("$NOTIFY" "$MESSAGE" 2>&1 >/dev/null); rc=$?
+    if [ "$rc" -ne 0 ]; then
+        ERR=$(printf '%s' "$ERR" | tr '\n' ' ' | cut -c1-300)
+        logline "send FAILED rc=$rc via $NOTIFY: ${ERR:-no output} - queue kept"
+        exit 1
+    fi
 fi
 
-# Step 2 (under the lock): remove exactly the delivered lines - anything
-# appended meanwhile stays queued - and stamp them into the sent window.
-python3 - "$ALERT_FILE" "$TMPD/lines.json" <<'PY'
+# the announce message rides the same sender with the chat id overridden; a
+# failure still removes the DELIVERED page entries below, logs, and exits 1
+# so the announce entries retry next minute
+ANN_FAILED=0
+if [ -s "$TMPD/msg.ann" ]; then
+    ANN_MSG=$(cat "$TMPD/msg.ann")
+    ERR=$(TG_CHAT_ID="${TG_ANNOUNCE_CHAT_ID:-}" "$NOTIFY" "$ANN_MSG" 2>&1 >/dev/null); rc=$?
+    if [ "$rc" -ne 0 ]; then
+        ANN_FAILED=1
+        ERR=$(printf '%s' "$ERR" | tr '\n' ' ' | cut -c1-300)
+        logline "announce send FAILED rc=$rc via $NOTIFY: ${ERR:-no output} - announce entries kept"
+    fi
+fi
+
+# Step 2 (under the lock): remove exactly the delivered raw entries - anything
+# appended meanwhile stays queued - and stamp their TEXTS into the sent window.
+# Takes one lines-file per delivered message.
+set --
+[ -s "$TMPD/msg" ] && set -- "$@" "$TMPD/lines.json"
+[ -s "$TMPD/msg.ann" ] && [ "$ANN_FAILED" -eq 0 ] && set -- "$@" "$TMPD/lines.ann.json"
+if [ "$#" -gt 0 ]; then
+python3 - "$ALERT_FILE" "$@" <<'PY'
 import fcntl, json, os, sys
 from datetime import datetime, timezone
 
-path, lines_path = sys.argv[1], sys.argv[2]
+path = sys.argv[1]
 sent_path = path + ".sent.json"
 now = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-with open(lines_path) as f:
-    delivered = json.load(f)
+delivered = []
+for lines_path in sys.argv[2:]:
+    with open(lines_path) as f:
+        delivered.extend(json.load(f))
 
 
 def write_json(p, obj):
@@ -203,8 +267,13 @@ with open(path + ".lock", "w") as lk:
     if not isinstance(sent, dict):
         sent = {}
     for a in delivered:
-        sent[a] = now
+        sent[a["text"] if isinstance(a, dict) else a] = now
     write_json(sent_path, sent)
 PY
-logline "sent via $NOTIFY: $(head -n 1 "$TMPD/msg")"
+fi
+[ -s "$TMPD/msg" ] && logline "sent via $NOTIFY: $(head -n 1 "$TMPD/msg")"
+if [ -s "$TMPD/msg.ann" ] && [ "$ANN_FAILED" -eq 0 ]; then
+    logline "sent announce via $NOTIFY: $(head -n 1 "$TMPD/msg.ann")"
+fi
+[ "$ANN_FAILED" -eq 0 ] || exit 1
 exit 0

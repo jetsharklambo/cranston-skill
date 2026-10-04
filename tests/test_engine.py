@@ -15,7 +15,14 @@ inherited env, reserved params keys, finding-key validation, remediation
 argument sanitization, and first_failed_at in state. Groups 27-29 cover the
 cycle-survival fixes: the per-service error boundary (_errors, CHECK_ERROR)
 and ENGINE_DEFAULTS, escalated re-nags renewing their pending approval, and a
-failed alert sink being retried next cycle (_sink) instead of lost.
+failed alert sink being retried next cycle (_sink) instead of lost. Groups
+30-35 cover the approve-heal hardening pass and consent pre-announcements:
+engine-shaped keys ('@'/':' subkeys) accepted and multi-slash rejected, the
+verify step surviving garbage output / a missing check with an
+APPROVED-RESULT audit line, the state lock released during the remediation
+run, corrupt/minimal state moved aside instead of crashing, and the
+announce channel firing before household-consent fixes (engine dict-auto +
+approve-heal).
 
 Run anywhere: python3 tests/test_engine.py
 """
@@ -801,6 +808,206 @@ hs.flush_alerts()
 ok(rec2["last_alert"] is None and hs.alerts == [], "...and the sink failing un-stamps that page as well")
 
 sh.local_network_up = real_lnu
+
+# Groups 30-33 and 35 drive approve-heal.py as a subprocess in its own temp
+# install root, like groups 20-22; the shared setup is factored out here.
+def ah_setup(paths=None):
+    ah2 = Path(tempfile.mkdtemp(prefix="cranston-ah-test-"))
+    for d in ("engine", "state", "remediations"):
+        (ah2 / d).mkdir()
+    shutil.copy(REPO / "authoring" / "scripts" / "engine" / "approve-heal.py",
+                ah2 / "engine" / "approve-heal.py")
+    fix2 = ah2 / "remediations" / "fix.sh"
+    fix2.write_text("#!/bin/bash\nexit 0\n")
+    (ah2 / "services.json").write_text(json.dumps(
+        {"version": 2, "paths": paths or {},
+         "defaults": {"verify_delay_seconds": 0, "check_timeout_seconds": 5},
+         "services": []}))
+    return ah2, fix2
+
+def ah_pending(ah2, key, script, arg=None, **extra):
+    (ah2 / "state" / "pending-approvals.json").write_text(json.dumps(
+        {key: dict({"status_code": "C", "script": str(script), "arg": arg,
+                    "expires": "2099-01-01T00:00:00Z"}, **extra)}))
+
+def ah_run(ah2, *argv):
+    env2 = dict(os.environ, SELFHEAL_CONFIG=str(ah2 / "services.json"))
+    return subprocess.run([sys.executable, str(ah2 / "engine" / "approve-heal.py"), *argv],
+                          capture_output=True, text=True, env=env2)
+
+print("== 30. approve-heal accepts engine-shaped keys, rejects multi-slash ==")
+# selfheal's valid_finding mints keys like <name>/<ARG_RE subkey> - '@' and
+# ':' included - so the approval door must accept exactly that shape.
+ah, fix = ah_setup()
+ah_pending(ah, "svcY/me@host:1", fix)
+r = ah_run(ah, "svcY/me@host:1")
+ok(r.returncode == 0 and "completed" in r.stdout,
+   "a subkey with '@' and ':' is approvable (matches valid_finding/ARG_RE)")
+r = ah_run(ah, "a/b/c")
+ok(r.returncode == 64 and "Usage" in r.stdout, "a multi-slash key is rejected at the door")
+shutil.rmtree(ah)
+
+print("== 31. verify step survives garbage check output and a missing check ==")
+ah, fix = ah_setup()
+chk_bad = ah / "chk-bad.sh"
+chk_bad.write_text("#!/bin/bash\necho '{not json'\nexit 1\n")
+cfg31 = json.loads((ah / "services.json").read_text())
+cfg31["services"] = [{"name": "svcX", "check": str(chk_bad), "remediations": {}}]
+(ah / "services.json").write_text(json.dumps(cfg31))
+ah_pending(ah, "svcX", fix)
+r = ah_run(ah, "svcX")
+pend = json.loads((ah / "state" / "pending-approvals.json").read_text())
+ok(r.returncode == 0 and "unverified" in r.stdout,
+   "garbage verify output: rc 0 with an unverified verdict, no traceback")
+ok("svcX" not in pend, "pending cleared despite the unverifiable check")
+audit = (ah / "state" / "audit.log").read_text()
+ok("APPROVED-RESULT service=svcX script=fix.sh verdict=unverified" in audit,
+   "the outcome reached the audit log as APPROVED-RESULT")
+# a service with no "check" key at all used to KeyError AFTER the fix ran
+cfg31["services"] = [{"name": "svcX", "remediations": {}}]
+(ah / "services.json").write_text(json.dumps(cfg31))
+ah_pending(ah, "svcX", fix)
+r = ah_run(ah, "svcX")
+pend = json.loads((ah / "state" / "pending-approvals.json").read_text())
+ok(r.returncode == 0 and "no health check" in r.stdout and "svcX" not in pend,
+   "missing check: rc 0 with the no-health-check verdict, pending cleared")
+shutil.rmtree(ah)
+
+print("== 32. the state lock is NOT held while the remediation runs ==")
+import time as time_mod
+ah, fix = ah_setup()
+started, release = ah / "started", ah / "release"
+slow = ah / "remediations" / "slow-fix.sh"
+slow.write_text("#!/bin/bash\n"
+                f"touch '{started}'\n"
+                f"for i in $(seq 1 100); do [ -f '{release}' ] && exit 0; sleep 0.1; done\n"
+                "exit 1\n")
+ah_pending(ah, "svcZ", slow)
+(ah / "state" / "state.json").write_text(json.dumps(
+    {"keys": {"svcZ": {"status": "awaiting_approval", "consecutive_failures": 3,
+                       "last_status_code": "C", "attempts": [], "last_alert": None,
+                       "last_transition": "2026-10-02T00:00:00Z"}}}))
+env32 = dict(os.environ, SELFHEAL_CONFIG=str(ah / "services.json"))
+proc = subprocess.Popen([sys.executable, str(ah / "engine" / "approve-heal.py"), "svcZ"],
+                        stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=env32)
+for _ in range(100):
+    if started.exists():
+        break
+    time_mod.sleep(0.05)
+ok(started.exists(), "the remediation is running")
+import fcntl as fcntl_mod
+with open(ah / "state" / ".lock", "w") as lk:
+    got_lock = True
+    try:
+        fcntl_mod.flock(lk, fcntl_mod.LOCK_EX | fcntl_mod.LOCK_NB)
+    except BlockingIOError:
+        got_lock = False
+    if got_lock:
+        # while we hold the lock, another key's record changes mid-run -
+        # phase 2's fresh re-read must preserve it
+        st32 = json.loads((ah / "state" / "state.json").read_text())
+        st32["keys"]["other"] = {"status": "failing", "consecutive_failures": 9}
+        (ah / "state" / "state.json").write_text(json.dumps(st32))
+        fcntl_mod.flock(lk, fcntl_mod.LOCK_UN)
+ok(got_lock, "the lock is free mid-remediation (a selfheal cycle would not be skipped)")
+release.write_text("")
+out32, _err32 = proc.communicate(timeout=30)
+st32 = json.loads((ah / "state" / "state.json").read_text())
+pend = json.loads((ah / "state" / "pending-approvals.json").read_text())
+ok(proc.returncode == 0 and "svcZ" not in pend, "approve-heal completed and cleared the pending entry")
+ok(st32["keys"]["other"]["consecutive_failures"] == 9,
+   "the mid-run edit to the OTHER key survived (phase 2 re-read state fresh)")
+ok(st32["keys"]["svcZ"]["consecutive_failures"] == 0, "and this key's record was still updated")
+shutil.rmtree(ah)
+
+print("== 33. corrupt or minimal state never crashes approve-heal ==")
+ah, fix = ah_setup()
+ah_pending(ah, "svcX", fix)
+(ah / "state" / "state.json").write_text("{garbage")
+r = ah_run(ah, "svcX")
+ok(r.returncode == 0 and "completed" in r.stdout, "corrupt state.json: the heal still completes")
+ok(list((ah / "state").glob("state.json.corrupt-*")),
+   "the corrupt file was moved aside, not silently treated as empty")
+ah_pending(ah, "svcX", fix)
+(ah / "state" / "state.json").write_text("{}")
+r = ah_run(ah, "svcX")
+ok(r.returncode == 0 and "completed" in r.stdout, "state.json without a 'keys' table: no KeyError")
+# a config with NO defaults block: VERIFY_DEFAULTS fills the verify tunables
+chk_ok33 = ah / "chk-ok.sh"
+chk_ok33.write_text("#!/bin/bash\nexit 0\n")
+(ah / "services.json").write_text(json.dumps(
+    {"version": 2, "paths": {},
+     "services": [{"name": "svcX", "check": str(chk_ok33),
+                   "verify_delay_seconds": 0, "remediations": {}}]}))
+ah_pending(ah, "svcX", fix)
+r = ah_run(ah, "svcX")
+ok(r.returncode == 0 and "verified HEALTHY" in r.stdout,
+   "a config without defaults verifies fine (VERIFY_DEFAULTS)")
+shutil.rmtree(ah)
+
+print("== 34. engine pre-announces dict-auto fixes with household/named consent ==")
+order34 = tmp / "order34.txt"
+sink34 = write_exec(tmp / "bin" / "announce-sink.sh",
+                    f'#!/bin/bash\necho "sink:${{SELFHEAL_ALERT_CHANNEL:-none}}:$1" >> "{order34}"\n')
+fix34 = write_exec(tmp / "remediations" / "noisy-fix.sh",
+                   f'#!/bin/bash\necho fix-ran >> "{order34}"\nexit 0\n')
+def svc_n(name, code, remediation):
+    return {"name": name, "enabled": True, "local": True, "check": "unused",
+            "verify_delay_seconds": 0, "remediations": {code: remediation}}
+svc_n1 = svc_n("svcN1", "C1", {"auto": fix34, "consent": "household",
+                               "announce": "music will stop for ~2 minutes"})
+svc_n2 = svc_n("svcN2", "C2", fix34)
+svc_n3 = svc_n("svcN3", "C3", {"auto": fix34, "consent": "admin", "announce": "never sent"})
+svc_n4 = svc_n("svcN4", "C4", {"auto": fix34, "consent": "household"})
+cfg34 = json.loads(json.dumps(CONFIG))
+cfg34["paths"] = {"alert_sink": ["bash", sink34]}
+cfg34["services"] = [svc_n1, svc_n2, svc_n3, svc_n4]
+hs = fresh(cfg34)
+hs.state = {"keys": {}}
+hs.run_check = lambda svc: {}            # verify re-check passes; real run_remediation
+def drive(svc, code):
+    f34 = {"status": code, "layer": "l", "detail": "d"}
+    hs.step(svc, svc["name"], f34)
+    hs.step(svc, svc["name"], f34)
+drive(svc_n1, "C1")
+ok(order34.read_text().splitlines() == ["sink:announce:music will stop for ~2 minutes", "fix-ran"],
+   "announce text hit the sink on channel=announce BEFORE the remediation ran")
+order34.write_text("")
+drive(svc_n2, "C2")
+ok(order34.read_text().splitlines() == ["fix-ran"], "plain-string auto: no announcement")
+order34.write_text("")
+drive(svc_n3, "C3")
+ok(order34.read_text().splitlines() == ["fix-ran"], "dict-auto with admin consent: no announcement")
+order34.write_text("")
+drive(svc_n4, "C4")
+lines34 = order34.read_text().splitlines()
+ok(len(lines34) == 2 and lines34[0].startswith("sink:announce:") and "svcN4" in lines34[0]
+   and lines34[1] == "fix-ran",
+   "household without announce text: the generated heads-up names the key")
+
+print("== 35. approve-heal pre-announces household-consent pending entries ==")
+ah, fix = ah_setup()
+order35 = ah / "order.txt"
+sink35 = ah / "capture-sink.sh"
+sink35.write_text("#!/bin/bash\n"
+                  f"echo \"sink:${{SELFHEAL_ALERT_CHANNEL:-none}}:$1\" >> '{order35}'\n")
+noisy35 = ah / "remediations" / "noisy.sh"
+noisy35.write_text(f"#!/bin/bash\necho fix-ran >> '{order35}'\nexit 0\n")
+cfg35 = json.loads((ah / "services.json").read_text())
+cfg35["paths"]["alert_sink"] = ["bash", str(sink35)]
+(ah / "services.json").write_text(json.dumps(cfg35))
+ah_pending(ah, "svcX", noisy35, consent="household",
+           announce="music will stop for ~2 minutes")
+r = ah_run(ah, "svcX")
+ok(r.returncode == 0
+   and order35.read_text().splitlines() == ["sink:announce:music will stop for ~2 minutes", "fix-ran"],
+   "the pending entry's announce hit the sink (channel=announce) before the fix")
+order35.unlink()
+ah_pending(ah, "svcX", noisy35, consent="admin", announce="never sent")
+r = ah_run(ah, "svcX")
+ok(r.returncode == 0 and order35.read_text().splitlines() == ["fix-ran"],
+   "admin consent: no announcement, just the fix")
+shutil.rmtree(ah)
 
 print(f"\nALL {PASS} ASSERTIONS PASSED")
 shutil.rmtree(tmp)

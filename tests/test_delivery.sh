@@ -37,7 +37,7 @@ freeport() { python3 -c 'import socket;s=socket.socket();s.bind(("127.0.0.1",0))
 
 echo "== syntax: the delivery scripts and the gate parse =="
 for f in "$BIN/send-alert.sh" "$BIN/notify-alerts.sh" "$BIN/send-telegram.sh" \
-         "$BIN/tailscale-running.sh" "$GT/secure-bash-argv.sh"; do
+         "$BIN/flush-digest.sh" "$BIN/tailscale-running.sh" "$GT/secure-bash-argv.sh"; do
     bash -n "$f" && ok "bash -n $(basename "$f")" || bad "bash -n $f"
     [ -x "$f" ] && ok "$(basename "$f") is executable" || bad "$f is not executable"
 done
@@ -154,9 +154,12 @@ NLOG="$T/notify.log"
 STUB="$T/stub-sender.sh"
 cat > "$STUB" <<'EOF'
 #!/bin/bash
-# stub SELFHEAL_NOTIFY_CMD: record the message; optionally append to the queue
-# while "sending" (the engine paging mid-delivery) or fail.
+# stub SELFHEAL_NOTIFY_CMD: record the message (last in STUB_LOG, every send
+# appended to .all, the per-send TG_CHAT_ID to .chat); optionally append to
+# the queue while "sending" (the engine paging mid-delivery) or fail.
 printf '%s\n' "$1" > "${STUB_LOG:?}"
+printf '%s\n' "$1" >> "${STUB_LOG}.all"
+printf '%s\n' "${TG_CHAT_ID:-}" >> "${STUB_LOG}.chat"
 echo x >> "${STUB_LOG}.count"
 [ -n "${STUB_APPEND:-}" ] && bash "${SENDALERT:?}" "$STUB_APPEND"
 [ -f "${STUB_FAIL:-/nonexistent}" ] && exit 1
@@ -167,7 +170,7 @@ NA=(SELFHEAL_ALERT_FILE="$AF" SELFHEAL_NOTIFY_CMD="$STUB" STUB_LOG="$SENTLOG" SE
 enqueue() { SELFHEAL_ALERT_FILE="$AF" bash "$BIN/send-alert.sh" "$@"; }
 alerts_json() { python3 -c 'import json,sys; print(json.dumps(json.load(open(sys.argv[1])).get("alerts",[]), ensure_ascii=False))' "$AF" 2>/dev/null || echo "<absent>"; }
 sends() { [ -f "$SENTLOG.count" ] && wc -l < "$SENTLOG.count" | tr -d ' ' || echo 0; }
-reset_na() { rm -f "$AF" "$AF.sent.json" "$AF.lock" "$AF.tmp" "$SENTLOG" "$SENTLOG.count" "$NLOG"; }
+reset_na() { rm -f "$AF" "$AF.sent.json" "$AF.lock" "$AF.tmp" "$SENTLOG" "$SENTLOG.count" "$SENTLOG.all" "$SENTLOG.chat" "$NLOG"; }
 WARN=$(python3 -c 'print("⚠️", end="")')   # ⚠️ with the variation selector, as the engine emits it
 
 reset_na
@@ -252,6 +255,173 @@ assert "default sender against HTTP 500 -> exit 1" 1 - -- \
     -u SELFHEAL_NOTIFY_CMD SELFHEAL_ALERT_FILE="$AF" "${TGENV[@]}" bash "$BIN/notify-alerts.sh"
 [ "$(alerts_json)" = '["🚨 default sender, API down"]' ] && ok "queue kept when the Bot API fails" || bad "queue after API 500: $(alerts_json)"
 echo ok > "$TGMODE"
+
+echo "== announce routing (channel queue + drainer) =="
+ann_enqueue() { SELFHEAL_ALERT_FILE="$AF" SELFHEAL_ALERT_CHANNEL=announce bash "$BIN/send-alert.sh" "$@"; }
+chats() { tr '\n' ' ' < "$SENTLOG.chat" 2>/dev/null | sed 's/ $//'; }
+ANN=("${NA[@]}" TG_CHAT_ID=111111 TG_ANNOUNCE_CHAT_ID=987654)
+
+# (a) the queue entry format, and queue-side dedupe on the object form
+reset_na
+ann_enqueue "music will stop while the speaker reboots"
+[ "$(alerts_json)" = '[{"text": "music will stop while the speaker reboots", "channel": "announce"}]' ] \
+    && ok "announce line queues as the {text, channel} object" || bad "announce queue form: $(alerts_json)"
+ann_enqueue "music will stop while the speaker reboots"
+[ "$(alerts_json)" = '[{"text": "music will stop while the speaker reboots", "channel": "announce"}]' ] \
+    && ok "identical announce line does not duplicate" || bad "announce dedupe: $(alerts_json)"
+
+# (b) mixed queue + announce chat set -> TWO sends on two chat ids
+reset_na
+enqueue "🚨 nas DOWN (SERVICE_DOWN)"
+ann_enqueue "music will stop while the speaker reboots"
+assert "mixed queue, announce chat set -> 0" 0 - -- "${ANN[@]}" bash "$BIN/notify-alerts.sh"
+[ "$(sends)" = 2 ] && ok "two sends: page then announce" || bad "two sends (got $(sends))"
+[ "$(chats)" = "111111 987654" ] && ok "page to the admin chat, announce to the announce chat" || bad "chat routing: '$(chats)'"
+grep -q "🚨 Cranston: 1 alert" "$SENTLOG.all" && grep -q "nas DOWN" "$SENTLOG.all" \
+    && ok "page message keeps its alert-count header" || bad "page message: $(cat "$SENTLOG.all")"
+first_line_is "announce message is the bare text" "$SENTLOG" "music will stop while the speaker reboots"
+grep -q "Cranston:" "$SENTLOG" && bad "announce message has no alert header" || ok "announce message has no alert header"
+[ ! -f "$AF" ] && ok "mixed queue fully delivered -> deleted" || bad "mixed queue after drain: $(alerts_json)"
+grep -q "sent announce via" "$NLOG" && ok "announce send is logged" || bad "announce send is logged ($(cat "$NLOG" 2>/dev/null))"
+
+# (c) same mixed queue, announce chat UNSET -> ONE folded send, nothing dropped
+reset_na
+enqueue "🚨 nas DOWN (SERVICE_DOWN)"
+ann_enqueue "music will stop while the speaker reboots"
+assert "mixed queue, announce chat unset -> 0" 0 - -- "${NA[@]}" bash "$BIN/notify-alerts.sh"
+[ "$(sends)" = 1 ] && ok "one folded send without the announce chat" || bad "folded sends (got $(sends))"
+first_line_is "folded header counts both" "$SENTLOG" "🚨 Cranston: 2 alerts"
+grep -q "music will stop" "$SENTLOG" && ok "announce text folded into the page, not dropped" || bad "folded body: $(cat "$SENTLOG")"
+[ ! -f "$AF" ] && ok "folded delivery removes the announce object too" || bad "queue after folded drain: $(alerts_json)"
+
+# (d) legacy hand-written queue drains exactly as before
+reset_na
+echo '{"alerts":["old line"]}' > "$AF"
+assert "legacy plain-string queue -> 0" 0 - -- "${ANN[@]}" bash "$BIN/notify-alerts.sh"
+first_line_is "legacy line keeps the plain header" "$SENTLOG" "Cranston: 1 alert"
+[ "$(sends)" = 1 ] && [ ! -f "$AF" ] && ok "legacy queue drains and deletes" || bad "legacy queue drain ($(sends) sends, queue $(alerts_json))"
+
+# (e) end to end: the REAL send-telegram.sh against the stub Bot API
+reset_na; : > "$REQLOG"; echo ok > "$TGMODE"
+enqueue "🚨 nas DOWN (SERVICE_DOWN)"
+ann_enqueue "music will stop while the speaker reboots"
+assert "end-to-end via send-telegram.sh -> 0" 0 - -- \
+    -u SELFHEAL_NOTIFY_CMD SELFHEAL_ALERT_FILE="$AF" "${TGENV[@]}" TG_ANNOUNCE_CHAT_ID=987654 bash "$BIN/notify-alerts.sh"
+[ "$(req_count)" = 2 ] && ok "two Bot API requests" || bad "Bot API requests (got $(req_count))"
+[ "$(req_field 1 chat_id)" = "123456789" ] && ok "page request carries the admin chat id" || bad "page chat_id: $(req_field 1 chat_id)"
+[ "$(req_field 2 chat_id)" = "987654" ] && ok "announce request carries the announce chat id" || bad "announce chat_id: $(req_field 2 chat_id)"
+[ "$(req_field 2 text)" = "music will stop while the speaker reboots" ] && ok "announce request is the bare text" || bad "announce text: $(req_field 2 text)"
+
+# (f) the announce send FAILS after a delivered page: sibling stub that fails
+# from the Nth call on, so call 1 (page) succeeds and call 2 (announce) fails
+STUB2="$T/stub-sender-fail-from.sh"
+cat > "$STUB2" <<'EOF'
+#!/bin/bash
+# like the main stub, but FAILS from call number STUB_FAIL_FROM (1-based) on
+printf '%s\n' "$1" > "${STUB_LOG:?}"
+printf '%s\n' "$1" >> "${STUB_LOG}.all"
+printf '%s\n' "${TG_CHAT_ID:-}" >> "${STUB_LOG}.chat"
+echo x >> "${STUB_LOG}.count"
+n=$(wc -l < "${STUB_LOG}.count" | tr -d ' ')
+[ "$n" -ge "${STUB_FAIL_FROM:-9999}" ] && exit 1
+exit 0
+EOF
+chmod +x "$STUB2"
+reset_na
+enqueue "🚨 nas DOWN (SERVICE_DOWN)"
+ann_enqueue "music will stop while the speaker reboots"
+assert "announce send fails -> exit 1" 1 - -- "${ANN[@]}" SELFHEAL_NOTIFY_CMD="$STUB2" STUB_FAIL_FROM=2 bash "$BIN/notify-alerts.sh"
+[ "$(alerts_json)" = '[{"text": "music will stop while the speaker reboots", "channel": "announce"}]' ] \
+    && ok "delivered page removed, failed announce entry kept" || bad "queue after announce failure: $(alerts_json)"
+grep -q "nas DOWN" "$AF.sent.json" && ! grep -q "music will stop" "$AF.sent.json" \
+    && ok "only the delivered page text enters the sent window" || bad "sent window after announce failure: $(cat "$AF.sent.json")"
+grep -q "announce send FAILED rc=1" "$NLOG" && ok "announce failure is logged" || bad "announce failure log: $(cat "$NLOG" 2>/dev/null)"
+assert "next minute retries the announce alone -> 0" 0 - -- "${ANN[@]}" bash "$BIN/notify-alerts.sh"
+first_line_is "retried announce is the bare text" "$SENTLOG" "music will stop while the speaker reboots"
+[ "$(tail -n 1 "$SENTLOG.chat")" = "987654" ] && ok "retry goes to the announce chat" || bad "retry chat: $(tail -n 1 "$SENTLOG.chat")"
+[ ! -f "$AF" ] && ok "queue empty after the announce retry" || bad "queue after announce retry: $(alerts_json)"
+
+# (g) the sent window covers announce texts too
+reset_na
+ann_enqueue "🎵 music pausing for an update"
+env "${ANN[@]}" bash "$BIN/notify-alerts.sh" >/dev/null 2>&1
+ann_enqueue "🎵 music pausing for an update"
+assert "announce repeat within the window -> 0" 0 - -- "${ANN[@]}" bash "$BIN/notify-alerts.sh"
+[ "$(sends)" = 1 ] && ok "announce text within the window is not re-sent" || bad "announce window repeat ($(sends) sends)"
+[ ! -f "$AF" ] && ok "within-window announce repeat dropped from the queue" || bad "announce repeat left: $(alerts_json)"
+grep -q "dropped 1 within-window repeat" "$NLOG" && ok "announce drop is logged" || bad "announce drop log ($(cat "$NLOG"))"
+
+echo "== flush-digest.sh (recording stub sender) =="
+DIG="$T/digest.jsonl"
+FDLOG="$T/flush.log"
+# SENDALERT stand-in for the digest: STUB_APPEND must land a JSONL line in the
+# DIGEST file (the engine appending mid-send), not in the alert queue
+DIGAPPEND="$T/digest-append.sh"
+cat > "$DIGAPPEND" <<'EOF'
+#!/bin/bash
+printf '{"system": "race", "message": "%s", "timestamp": "2026-10-04T09:30:00Z"}\n' "$1" >> "${DIG_FILE:?}"
+EOF
+chmod +x "$DIGAPPEND"
+FD=(SELFHEAL_DIGEST_FILE="$DIG" SELFHEAL_NOTIFY_CMD="$STUB" STUB_LOG="$SENTLOG" SENDALERT="$DIGAPPEND" DIG_FILE="$DIG" SELFHEAL_LOG_FILE="$FDLOG")
+dig_entry() { printf '{"system": "%s", "message": "%s", "timestamp": "%s"}\n' "$1" "$2" "$3" >> "$DIG"; }
+reset_fd() { rm -f "$DIG" "$DIG.lock" "$DIG.before" "$SENTLOG" "$SENTLOG.count" "$SENTLOG.all" "$SENTLOG.chat" "$FDLOG"; }
+
+reset_fd
+assert "missing digest -> 0, silent" 0 - -- "${FD[@]}" bash "$BIN/flush-digest.sh"
+[ "$(sends)" = 0 ] && ok "missing digest -> no send" || bad "missing digest sent ($(sends))"
+: > "$DIG"
+assert "empty digest -> 0, silent" 0 - -- "${FD[@]}" bash "$BIN/flush-digest.sh"
+[ "$(sends)" = 0 ] && ok "empty digest -> no send" || bad "empty digest sent ($(sends))"
+
+reset_fd
+dig_entry nas "disk 91% full" "2026-10-04T08:00:00Z"
+dig_entry nas "disk 92% full" "2026-10-04T09:00:00Z"
+dig_entry navidrome "LAN path flapping" "2026-10-04T08:30:00Z"
+assert "3 entries / 2 systems -> 0" 0 - -- "${FD[@]}" bash "$BIN/flush-digest.sh"
+[ "$(sends)" = 1 ] && ok "one send for the whole digest" || bad "digest sends (got $(sends))"
+first_line_is "fallback header" "$SENTLOG" "⚠️ Daily issues digest (summary didn't run - fallback sender):"
+grep -q "^nas:$" "$SENTLOG" && grep -q "^navidrome:$" "$SENTLOG" && ok "grouped by system" || bad "grouping: $(cat "$SENTLOG")"
+grep -q "^  • 2026-10-04 08:00: disk 91% full$" "$SENTLOG" && ok "bullet carries timestamp + message" || bad "bullets: $(cat "$SENTLOG")"
+[ ! -s "$DIG" ] && ok "sent digest is cleared" || bad "digest after send: $(cat "$DIG")"
+grep -q "sent fallback digest" "$FDLOG" && ok "flush is logged" || bad "flush log: $(cat "$FDLOG" 2>/dev/null)"
+
+reset_fd
+dig_entry nas "disk 91% full" "2026-10-04T08:00:00Z"
+assert "mid-send append -> 0" 0 - -- "${FD[@]}" STUB_APPEND="engine wrote me mid-send" bash "$BIN/flush-digest.sh"
+grep -q "engine wrote me mid-send" "$DIG" && ok "mid-send entry survives in the file" || bad "mid-send entry lost: $(cat "$DIG")"
+grep -q "disk 91% full" "$DIG" && bad "sent line removed despite the race" || ok "sent line removed despite the race"
+assert "second run delivers the survivor" 0 - -- "${FD[@]}" bash "$BIN/flush-digest.sh"
+grep -q "engine wrote me mid-send" "$SENTLOG" && ok "survivor delivered on the next run" || bad "survivor message: $(cat "$SENTLOG")"
+[ ! -s "$DIG" ] && ok "digest empty after the second run" || bad "digest after second run: $(cat "$DIG")"
+
+reset_fd
+dig_entry nas "disk 91% full" "2026-10-04T08:00:00Z"
+dig_entry navidrome "LAN path flapping" "2026-10-04T08:30:00Z"
+cp "$DIG" "$DIG.before"; touch "$T/fail"
+assert "failing sender -> exit 1, digest kept" 1 - -- "${FD[@]}" STUB_FAIL="$T/fail" bash "$BIN/flush-digest.sh"
+cmp -s "$DIG" "$DIG.before" && ok "failed flush leaves the digest byte-identical" || bad "digest changed on failure"
+grep -q "send FAILED" "$FDLOG" && ok "flush failure is logged" || bad "flush failure log: $(cat "$FDLOG" 2>/dev/null)"
+rm -f "$T/fail" "$DIG.before"
+
+reset_fd
+dig_entry nas "disk 91% full" "2026-10-04T08:00:00Z"
+echo 'this line is not json {' >> "$DIG"
+dig_entry navidrome "LAN path flapping" "2026-10-04T08:30:00Z"
+assert "unparseable line mixed in -> 0" 0 - -- "${FD[@]}" bash "$BIN/flush-digest.sh"
+grep -q "not json" "$SENTLOG" && bad "message omits the unparseable line" || ok "message omits the unparseable line"
+grep -q "disk 91% full" "$SENTLOG" && grep -q "LAN path flapping" "$SENTLOG" && ok "valid entries still delivered" || bad "valid entries: $(cat "$SENTLOG")"
+grep -qF 'this line is not json {' "$DIG" && ok "unparseable line is kept in the file" || bad "unparseable line gone: $(cat "$DIG")"
+grep -q "disk 91% full" "$DIG" && bad "delivered entries removed around the bad line" || ok "delivered entries removed around the bad line"
+
+# pinned current behavior: clearing matches on message TEXT, so twins with
+# different timestamps are BOTH cleared by the one send (the dedupe-by-message
+# gotcha documented in flush-digest.sh)
+reset_fd
+dig_entry nas "disk 91% full" "2026-10-04T08:00:00Z"
+dig_entry nas "disk 91% full" "2026-10-04T10:00:00Z"
+assert "identical messages, two timestamps -> 0" 0 - -- "${FD[@]}" bash "$BIN/flush-digest.sh"
+[ "$(sends)" = 1 ] && ok "one send covers both twins" || bad "twin sends (got $(sends))"
+[ ! -s "$DIG" ] && ok "BOTH twins cleared by one send (dedupe-by-text, pinned)" || bad "twins left: $(cat "$DIG")"
 
 echo "== tailscale-running.sh (stub tailscale on PATH) =="
 TSBIN="$T/tsbin"; mkdir -p "$TSBIN"

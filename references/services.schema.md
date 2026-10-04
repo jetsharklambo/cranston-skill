@@ -67,8 +67,14 @@ All relative paths resolve against the install root (the directory containing
                                     // engine refuses the whole service with CHECK_ERROR.
       "remediations": {             // finding code -> remediation class:
         "SERVICE_DOWN": "remediations/templates/restart-systemd-unit.sh",  // AUTO (string)
+        "API_ERROR": { "auto": "remediations/templates/restart-systemd-unit.sh",
+                       "consent": "household",                              // AUTO (dict):
+                       "announce": "restarting the media box — music will stop ~2 min" },
+                                    // same as the string form, plus a consent scope and an
+                                    // optional pre-announcement sent just before the fix runs
         "HOST_DOWN": { "ask": "remediations/my-outlet.sh", "arg": "svcoutlet",
-                       "consent": "household" },                            // ASK-FIRST
+                       "consent": "household",
+                       "announce": "power-cycling the streambox outlet" },   // ASK-FIRST
         "LAN_UNREACHABLE": null     // WATCH-ONLY (alert, no fix proposed)
         // a fourth class exists by OMISSION: on-demand remediations are not
         // wired to any code — the agent may run them only on an explicit
@@ -106,10 +112,20 @@ All relative paths resolve against the install root (the directory containing
 - **Digest discipline.** A failed digest write pages instead of dropping the
   line. The digest file is rendered by the adapter's daily summary and by
   `bin/flush-digest.sh` as the cron fallback — both under `<digest>.lock`.
-- **`consent` on an ask-first entry** is carried for the adapter's alert
-  composer: `"admin"` (default), `"named:<person>"`, or `"household"` —
-  whose OK the fix needs is separate from whether the agent may act.
-  (The engine stores and forwards it; enforcement wording is the adapter's.)
+- **`consent` routes pre-announcements.** `"admin"` (default),
+  `"named:<person>"`, or `"household"` — whose evening the fix ruins is
+  separate from whether the agent may act. On a dict entry (ask-first or
+  auto-dict) whose consent is not `admin`, the engine queues a plain-language
+  pre-announcement (the entry's `announce` text, or a generated fallback)
+  through the alert sink with `SELFHEAL_ALERT_CHANNEL=announce` just before
+  the fix runs — at approval time for ask-first (`approve-heal.py`), at
+  remediation time for auto. `bin/notify-alerts.sh` delivers announce lines
+  to `TG_ANNOUNCE_CHAT_ID` when set, otherwise folds them into the admin
+  page; an announce failure never blocks or fails the fix.
+- **Cycles stretch by `verify_delay_seconds` per remediation attempted**
+  (the engine sleeps inline before re-checking each heal). This is by
+  design — bound it with `max_attempts`/`cooldown_minutes`; the cron
+  `flock -n` makes an overrun skip the next cycle rather than overlap.
 - **`first_failed_at`** (a `state.json` record field) is stamped when a key's
   current incident began; it survives re-pages (which move `last_transition`),
   is cleared on recovery, and is what the interview's retire question reads to
