@@ -56,7 +56,8 @@ ok("hermes frontmatter omits soft env (no required_environment_variables)",
    and "TG_BOT_TOKEN" not in hermes_skill.split("---")[1])
 ok("hermes frontmatter has no openclaw namespace", "openclaw" not in hermes_skill.split("---")[1])
 ok("openclaw frontmatter gates only hard bins",
-   re.search(r"bins: \[python3, bash, curl\]", root_skill) is not None)
+   re.search(r"bins: \[python3, bash, curl, ping\]", root_skill) is not None
+   and "tailscale" not in root_skill.split("---")[1])
 ok("openclaw soft env is required: false",
    "required: false" in root_skill and "requires:\n      env" not in root_skill)
 norm = lambda s: s.split("Install, operate,", 1)[1].replace(

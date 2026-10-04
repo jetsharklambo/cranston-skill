@@ -29,7 +29,7 @@ Callers, distinguished by environment:
 | Caller | Env | What the gate should do |
 |---|---|---|
 | engine auto path | `SELFHEAL_AUTOMATION=true`, `SELFHEAL_CALLER=selfheal.py` | pass through non-interactively IF the script lives under `$SELFHEAL_ROOT/remediations/` (auto-class fixes are fail-safe by design; blocking them on a human breaks self-healing) |
-| human approval | `SELFHEAL_CALLER=approve-heal`, plus `GATE_CODE` when the admin's reply carried a code (`approve-heal.py <key> <code>`) | demand the second factor |
+| human approval | `SELFHEAL_CALLER=approve-heal`, plus `GATE_CODE` when the admin's reply carried a code (`approve-heal.py <key> <code>`) | demand the second factor — or hand the validated command to the deployment's own factor, as `gates/secure-bash-argv.sh` does |
 
 Budgets: the engine's auto path allows 180 s total; `approve-heal.py` allows 300 s
 total, so keep human interaction within ~120 s (`GATE_TIMEOUT` in the templates).
@@ -52,7 +52,7 @@ Probe (commands) and ask (questions); record the answers:
 
 | Condition | Recommendation |
 |---|---|
-| D1 yes | **Reuse the existing gate.** Don't build a second one. |
+| D1 yes | **Reuse the existing gate** through `gates/secure-bash-argv.sh`: the engine speaks argv, the deployment's wrapper takes one shell string, and this gate is the validated bridge between them. Its mode-600 env file `~/.cranston-gate-secure-bash.env` names the wrapper (`SECURE_BASH=/path/to/wrapper`). Don't build a second factor. |
 | D2 risky **and** D4 yes | **Tier 2**: `gates/gate-totp-remote.sh` here + `gates/gate-totp-server.py` on the second device. |
 | D2 risky **and** D3 yes (no second device) | **Tier 1**: `gates/gate-telegram-confirm.sh`. |
 | D2 risky, no factor possible (no bot, no second device) | **Don't gate — shrink**: demote the risky remediations to watch-only until a factor exists. A weaker gate is not the answer. |
@@ -80,6 +80,12 @@ Probe (commands) and ask (questions); record the answers:
   When a second device or a chat bot shows up, we upgrade."
 - **Reuse**: "Your deployment already routes dangerous commands through <gate>; the
   engine will use the same path, so there's one audit trail and one factor."
+  Wire it: `"approval_gate": "gates/secure-bash-argv.sh"` in `services.json`,
+  `SECURE_BASH=<path of the wrapper>` in `~/.cranston-gate-secure-bash.env`
+  (`chmod 600`), and point the deployment's dangerous-command detector at the
+  gate file itself — the gate anchors the remediation to
+  `$SELFHEAL_ROOT/remediations/` on *both* paths, so it is the allowlist anchor
+  the detector's bypass rule names. `GATE_CODE` passes through to the wrapper.
 
 ## The anti-pattern (name it when you see it)
 
@@ -87,6 +93,22 @@ Probe (commands) and ask (questions); record the answers:
 ~/.totp_secret)"` feels like 2FA, but the agent can read the same file and mint its
 own codes. The factor must live where the agent isn't: another device (Tier 2) or
 the admin's phone via a channel the gate reads directly (Tier 1).
+
+## The shipped gates
+
+| File | Tier | Second factor | Pinned in (mode 600) |
+|---|---|---|---|
+| `scripts/gates/TEMPLATE.sh` | — | none: the skeleton every gate below starts from; refuses on the human path | — |
+| `scripts/gates/gate-totp-remote.sh` + `scripts/gates/gate-totp-server.py` | 2 | TOTP verified on a second device | `~/.cranston-gate-totp.env` (`GATE_TOTP_URL`) |
+| `scripts/gates/gate-telegram-confirm.sh` | 1 | one-time nonce confirmed from the admin's chat | `~/.cranston-gate-telegram.env` (`GATE_TG_BOT_TOKEN`, `GATE_TG_CHAT_ID`) |
+| `scripts/gates/secure-bash-argv.sh` | Reuse | the deployment's existing one-string 2FA wrapper (e.g. an OpenClaw secure-bash) | `~/.cranston-gate-secure-bash.env` (`SECURE_BASH`) |
+
+All four share the same step 0 (argv shape, full resolved path) and step 1
+(auto-pass under `remediations/`). `secure-bash-argv.sh` additionally
+requires the `remediations/` anchor on the human path, and is the one gate
+that composes a string — `bash <fullpath> [arg]` — from parts it has already
+validated (resolved path restricted to `[A-Za-z0-9/._-]`, argument matched
+against the engine's rule), audited as `GATE-FORWARDED`.
 
 ## Writing your own gate
 
@@ -101,6 +123,7 @@ Start from `scripts/gates/TEMPLATE.sh`. Checklist:
 4. Pin identities — chat id, verifier URL — in a mode-600 env file, never in
    `services.json`.
 5. Fail closed: timeout, unreachable verifier, malformed anything → exit 65.
-6. Audit every decision (`GATE-AUTO-PASS` / `GATE-APPROVED` / `GATE-REFUSED`) and
-   show the approver the full resolved script path, never the basename.
+6. Audit every decision (`GATE-AUTO-PASS` / `GATE-APPROVED` / `GATE-REFUSED`, or
+   `GATE-FORWARDED` when the decision is handed to the deployment's own wrapper)
+   and show the approver the full resolved script path, never the basename.
 7. Test the refusal path before the approval path.

@@ -36,18 +36,41 @@ new codes.
 
 ## Adapter gaps this example exposes (phase 3 work)
 
-1. **`secure-bash-argv.sh` does not exist yet.** The v1 secure-bash takes one
-   shell STRING and `eval`s it; the v2 gate contract is an argv prefix. The
-   OpenClaw adapter needs a thin wrapper that validates `$1` (script path
-   anchored to the remediations dir) + optional `$2` (one sanitized arg) and
-   execs them — no eval. The dangerous-detector bypass rule then anchors on
-   the wrapper.
-2. **`tailscale-running.sh` does not exist yet** — a 3-line guard
-   (`tailscale status --json | grep '"BackendState": "Running"'`) referenced
-   as `ALT_GUARD_CMD`.
-3. **Delivery half of alerting** — `alert_sink` queues into the pending file;
-   OpenClaw's `notify-alerts.sh` (every-minute cron, honest headers, DNS
-   fallback, delete-on-2xx) is the delivery reference for other adapters.
-4. **Consent routing** — the engine now carries `consent` on ask-first
-   proposals ("This affects the household — give them a heads-up."); the
-   adapter's alert composer and any household-announce channel build on it.
+Three of the four are shipped. The example's absolute `.../workspace/bin/`
+paths for the gate and the guard are the deployment's copies of the files
+named below.
+
+1. **`secure-bash-argv.sh` — shipped as `scripts/gates/secure-bash-argv.sh`.**
+   The v1 secure-bash takes one shell STRING and `eval`s it; the v2 gate
+   contract is an argv prefix. The gate validates `$1` (resolved to a full
+   path, anchored to `$SELFHEAL_ROOT/remediations/` on *both* the auto and the
+   human path) + optional `$2` (one `[A-Za-z0-9][A-Za-z0-9._@:-]{0,63}`
+   token), auto-passes the engine's allowlisted path with `exec bash "$@"`,
+   and on the human path hands the wrapper named in mode-600
+   `~/.cranston-gate-secure-bash.env` (`SECURE_BASH=...`) the one string
+   `bash <fullpath> [arg]` — composed only from those validated parts, never
+   eval'd here, audited `GATE-FORWARDED`. `GATE_CODE` passes through. The
+   dangerous-detector bypass rule anchors on the gate file.
+2. **`tailscale-running.sh` — shipped as `scripts/bin/tailscale-running.sh`**,
+   the `ALT_GUARD_CMD`: exit 0 iff `tailscale status --json` reports
+   `"BackendState": "Running"` (parsed as JSON, not grepped), 1 otherwise —
+   including when tailscale is not installed.
+3. **Delivery half of alerting — shipped as `scripts/bin/notify-alerts.sh` +
+   `scripts/bin/send-telegram.sh`.** `alert_sink` still only queues into the
+   pending file; the every-minute drainer takes the queue's lock, heads ONE
+   message with the worst line present (🚨 > ⚠️ > 🔧 > ✅ > other), delivers
+   through `SELFHEAL_NOTIFY_CMD` (default: the Telegram sender — Bot API,
+   `TG_API_IP` DNS fallback, 4096-character chunking at line boundaries, exit
+   non-zero unless every chunk got 2xx), removes exactly the delivered lines on
+   success and keeps the queue on failure. Two things the install must get
+   right: `SELFHEAL_ALERT_FILE` must be the same value for the engine's cron
+   line (the writer) and the drainer's (the install puts it in
+   `/etc/cranston.env`, sourced by every cron line), and the drainer keeps a
+   sent-text window (`<file>.sent.json`, `SELFHEAL_SENT_WINDOW_MINUTES`,
+   default 30) because queue-side dedupe cannot see what was already
+   delivered. This is the delivery reference for other adapters.
+4. **Consent routing — still open.** The engine now carries `consent` on
+   ask-first proposals ("This affects the household — give them a heads-up.");
+   the adapter's alert composer and any household-announce channel build on
+   it. Nothing shipped here consumes it yet: `notify-alerts.sh` relays the
+   engine's lines as they are.

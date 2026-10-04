@@ -189,9 +189,9 @@ Nine layers, generalized from the reference deployment's defense-in-depth:
 | Phase | Scope | Status today |
 |---|---|---|
 | 1 — Blueprint | design review and iteration | **done** (this document is its published form) |
-| 2 — Engine generalization | `params`/`paths`/pluggable edges, remediation library, parameterized templates, debt fixes, stub-harness test suite | **shipped** — engine, 9 check + 4 remediation templates, gates, tests, and the dual-platform packaging/build all live in this repo |
-| 3 — OpenClaw adapter | SKILL.md, installer, detector snippet, end-to-end install on a clean machine | **half done** — the skill body and gate shims ship; the installer, the default alert-sender wiring, and the harness shims are open |
-| 4 — Publication & methodology | registry packaging, risk disclosure, methodology split into runnable modules | **in progress** — approval-gates and failure-modes are shipped as interview-grade modules; discovery, interview, and doctrine follow |
+| 2 — Engine generalization | `params`/`paths`/pluggable edges, remediation library, parameterized templates, debt fixes, stub-harness test suite | **shipped** — engine, 9 check + 6 remediation templates, gates, tests, and the dual-platform packaging/build all live in this repo |
+| 3 — OpenClaw adapter | SKILL.md, installer, detector snippet, end-to-end install on a clean machine | **mostly done** — the skill body, the gate templates and the OpenClaw runtime shims ship (`gates/secure-bash-argv.sh`, `bin/tailscale-running.sh`, and the `bin/notify-alerts.sh` → `bin/send-telegram.sh` delivery pair draining the `send-alert.sh` queue); still open: the installer and consent routing |
+| 4 — Publication & methodology | registry packaging, risk disclosure, methodology split into runnable modules | **in progress** — the methodology is shipped as runnable modules: approval-gates, failure-modes, discovery, interview (runnable per device via `scripts/onboard/interview.py`) and doctrine; registry publication is open |
 
 The Hermes artifact is generated from the same source and is
 **experimental**: OpenClaw is the only harness this has actually run behind.

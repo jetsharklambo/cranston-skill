@@ -8,7 +8,7 @@ skill:
   name: cranston
   description: Self-healing home monitor that fixes, asks first, or digests
   license: MIT-0
-  compatibility: Requires python3 3.9+, bash, curl, and system cron on an always-on LAN box
+  compatibility: Requires python3 3.9+, bash, curl, ping, and system cron on an always-on LAN box
   author: jetsharklambo
   version: 0.2.0
   homepage: https://github.com/jetsharklambo/cranston-skill
@@ -25,22 +25,28 @@ dependencies:
       mode: hard
     - name: curl
       mode: hard
+    - name: ping
+      mode: hard
+      required_for: the engine network gate (gateway ping) and the ping-split check templates
     - name: dig
       mode: soft
       required_for: the check-dns.sh template
     - name: openssl
       mode: soft
       required_for: the check-cert-expiry.sh template
+    - name: tailscale
+      mode: soft
+      required_for: the bin/tailscale-running.sh alt-transport guard
   env:
     - name: TG_BOT_TOKEN
       mode: soft
       prompt: Telegram bot token (from @BotFather)
       help: https://core.telegram.org/bots/tutorial
-      required_for: the example Telegram alert sink only; any alert sink command works
+      required_for: the bundled Telegram sender bin/send-telegram.sh (the default delivery path); any alert sink command works
     - name: TG_CHAT_ID
       mode: soft
       prompt: Telegram chat id for alerts
-      required_for: the example Telegram alert sink only; any alert sink command works
+      required_for: the bundled Telegram sender bin/send-telegram.sh (the default delivery path); any alert sink command works
 
 hermes:
   tags:

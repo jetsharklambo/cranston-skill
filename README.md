@@ -49,9 +49,10 @@ authoring/              THE hand-edited source
     engine/selfheal.py    the orchestrator: one cycle per run, from OS cron
     engine/approve-heal.py executes a human-approved pending fix, then verifies
     engine/lib/           emit/param + audit->cap->act->verify skeletons
-    bin/                  default queueing alert sink + daily-digest flusher
+    bin/                  alert queue + cron drainer + Telegram sender, digest flusher, Tailscale guard
     checks/templates/     9 parameterized check archetypes (see below)
-    remediations/templates/ skeleton + 3 archetypes
+    remediations/templates/ skeleton + 5 archetypes
+    gates/                approval-gate templates + the secure-bash argv wrapper
   references/           schema v2 docs, hardware guide, worked example, methodology
   assets/               minimal starter config
 SKILL.md + scripts/ + references/ + assets/   GENERATED (OpenClaw root artifact)
@@ -59,6 +60,7 @@ skills/cranston/                              GENERATED (Hermes tap artifact)
 tools/                  build.py + check_drift.py + validate_links.py
 tests/                  engine suite (60 assertions) + template smoke tests (51)
                         + build tooling tests (22) + methodology guards (31)
+                        + delivery suite (queue -> drainer -> sender, offline)
 docs/                   the dual-platform repository spec + design notes
 ```
 
@@ -108,7 +110,7 @@ agent may act.
 
 | Template | Archetype |
 |---|---|
-| `check-http.sh` | HTTP endpoint: optional auth, optional second transport, ping split, degraded blind findings |
+| `check-http.sh` | HTTP endpoint: optional auth, optional second transport (guarded by `bin/tailscale-running.sh` on a tailnet), ping split, degraded blind findings |
 | `check-dns.sh` | resolver with upstream isolation (a WAN outage is never the resolver's fault) |
 | `check-systemd-unit.sh` | unit + port + dual-sink log-staleness wedge heuristic |
 | `check-tcp-port.sh` | plain TCP reachability with ping split |
@@ -129,8 +131,9 @@ it must still be running when the internet is down, because that's the
 moment it exists for. A cloud VPS cannot do this job (it can't tell
 "internet down" from "house down", and it disappears from your house
 exactly when the WAN does). Software needs are tiny: `python3` 3.9+,
-`bash`, `curl`, `cron` (plus `dig`/`openssl` for two optional templates;
-the systemd/sysfs templates are Linux-only).
+`bash`, `curl`, `ping`, `cron` (plus `dig`/`openssl` for two optional
+templates and `tailscale` for the alt-transport guard; the systemd/sysfs
+templates are Linux-only).
 
 Two posture rules, both paid for in the reference home's incident log:
 **wire it with Ethernet** (the monitor must not share a failure mode with
@@ -185,10 +188,12 @@ whole loop against a fake LAN.
 ## First deployment
 
 What a first install looks like today, honestly: the **core is standalone-able**
-(engine + templates + your own alert sender), while the polished OpenClaw
-adapter (SKILL.md, installer, 2FA gate shim) is phase 3. These steps assume a
-small always-on Linux box (a Pi, a NUC, an old laptop) that can reach the
-things it should watch.
+(engine + templates + the bundled Telegram delivery, or your own sender), and
+the OpenClaw runtime shims ship with it (`gates/secure-bash-argv.sh`,
+`bin/tailscale-running.sh`, and the `bin/notify-alerts.sh` →
+`bin/send-telegram.sh` delivery pair); an installer and consent routing are
+the phase-3 work still open. These steps assume a small always-on Linux box
+(a Pi, a NUC, an old laptop) that can reach the things it should watch.
 
 ### 0. Prerequisites
 
@@ -220,24 +225,39 @@ break beat twelve you don't. Field-by-field docs:
 ### 2. Wire the alert path (the part that makes it yours)
 
 The engine calls `paths.alert_sink` with alert lines as arguments. The
-default sink only queues into a pending file — **something must deliver it**.
-Quickest standalone wiring: point `alert_sink` straight at a sender script.
-Telegram example (create a bot with @BotFather, get your chat id):
+default sink, `bin/send-alert.sh`, only queues them into a pending file;
+`bin/notify-alerts.sh` drains that file from cron every minute (step 4) and
+delivers through `bin/send-telegram.sh`, deleting a line only once it was
+sent. Create a bot with @BotFather, get your chat id, and put the secrets
+and the shared alert-file path in ONE mode-600 file that every cron line
+sources (the alert file must be the same for the engine's sink and the
+drainer; under `state/` it is off `/tmp`, which a reboot wipes):
+
+```bash
+cat > /etc/cranston.env <<'EOF'
+export TG_BOT_TOKEN=<token from @BotFather>
+export TG_CHAT_ID=<chat id the bot may write to>
+export SELFHEAL_ALERT_FILE=/opt/cranston/state/alert-pending.json
+EOF
+chmod 600 /etc/cranston.env
+. /etc/cranston.env; bin/send-telegram.sh "cranston test page"
+```
+
+Leave `"alert_sink": "bin/send-alert.sh"` as the starter config has it, and
+never put the token in `services.json`. Alternative: any command that
+delivers lines of text works as `alert_sink` — a standalone sender
+(`"alert_sink": "bin/my-sink.sh"`) is one `curl`:
 
 ```bash
 cat > bin/my-sink.sh <<'EOF'
 #!/bin/bash
 # direct Telegram delivery; called with alert lines as args
 TEXT=$(printf '%s\n' "$@")
-curl -s --max-time 15 "https://api.telegram.org/bot${TG_BOT_TOKEN}/sendMessage" \
+curl -fsS --max-time 15 "https://api.telegram.org/bot${TG_BOT_TOKEN}/sendMessage" \
      --data-urlencode "chat_id=${TG_CHAT_ID}" --data-urlencode "text=${TEXT}" >/dev/null
 EOF
 chmod +x bin/my-sink.sh
 ```
-
-Set `"alert_sink": "bin/my-sink.sh"` and put the two env vars in the cron
-line (step 4). Keep the token in a mode-600 file the cron line sources, not
-in the config.
 
 ### 3. Dry-run one cycle
 
@@ -254,13 +274,16 @@ fix it, run cycles until the held ✅ releases (~10 min of health).
 ### 4. Put it on cron
 
 ```cron
-*/2 * * * * flock -n /tmp/cranston.cronlock python3 /opt/cranston/engine/selfheal.py >> /var/log/cranston.log 2>&1
-25 5 * * *  SELFHEAL_DIGEST_FILE=/opt/cranston/state/digest.jsonl SELFHEAL_NOTIFY_CMD=/opt/cranston/bin/my-sink.sh /opt/cranston/bin/flush-digest.sh
+*/2 * * * * . /etc/cranston.env; flock -n /tmp/cranston.cronlock python3 /opt/cranston/engine/selfheal.py >> /var/log/cranston.log 2>&1
+* * * * *   . /etc/cranston.env; /opt/cranston/bin/notify-alerts.sh >> /var/log/cranston.log 2>&1
+25 5 * * *  . /etc/cranston.env; SELFHEAL_DIGEST_FILE=/opt/cranston/state/digest.jsonl SELFHEAL_NOTIFY_CMD=/opt/cranston/bin/send-telegram.sh /opt/cranston/bin/flush-digest.sh >> /var/log/cranston.log 2>&1
 ```
 
-System cron, never an agent's scheduler — the whole point is that monitoring
-survives the agent dying. (On a box without `flock`, drop it; the engine
-holds its own fcntl lock.)
+Every line sources `/etc/cranston.env` first: cron starts from an empty
+environment, so without it the sender has no token and the engine and the
+drainer would use different alert files. System cron, never an agent's
+scheduler — the whole point is that monitoring survives the agent dying.
+(On a box without `flock`, drop it; the engine holds its own fcntl lock.)
 
 ### 5. Approvals
 
@@ -294,6 +317,11 @@ onboarding). The ladder:
   `gate-totp-server.py`): a single-file, dependency-free RFC-6238 verifier
   on a *second* device (HA box, NAS, an old phone — see `references/hardware.md`),
   so the agent's box can never mint its own approvals. No Docker.
+- **Already gated?** If the deployment routes dangerous commands through a
+  one-shell-string 2FA wrapper (OpenClaw's secure-bash),
+  `gates/secure-bash-argv.sh` fronts it as the argv prefix the engine
+  expects, anchoring scripts to `remediations/` on both the automation and
+  the human path.
 
 If none of those are possible and a remediation is risky, the right answer
 is not a weaker gate — it's demoting that remediation to watch-only until a
@@ -339,17 +367,20 @@ be added until one exists.
 
 ### Dependencies and secrets
 
-Hard: `python3` (3.9+), `bash`, `curl`. Soft: `dig` (DNS template),
-`openssl` (cert template), and `TG_BOT_TOKEN`/`TG_CHAT_ID` — needed only by
-the example Telegram sink; any `alert_sink` command of your own works
-without them. Never put secret values in `services.json`; keep them in a
-mode-600 file the cron line sources.
+Hard: `python3` (3.9+), `bash`, `curl`, `ping` (the engine's network gate
+and the ping-split templates). Soft: `dig` (DNS template), `openssl` (cert
+template), `tailscale` (the `bin/tailscale-running.sh` alt-transport
+guard), and `TG_BOT_TOKEN`/`TG_CHAT_ID` — needed by the bundled Telegram
+sender `bin/send-telegram.sh`; any `alert_sink` command of your own works
+without them. Never put secret values in `services.json`; keep them in
+`/etc/cranston.env` (mode 600), which every cron line sources.
 
 ## Running the tests
 
 ```
 python3 tests/test_engine.py     # 60 assertions, isolated temp install
 bash tests/test_templates.sh     # 51 assertions, offline (local stub servers)
+bash tests/test_delivery.sh      # offline: alert queue -> drainer -> sender contract
 python3 tests/test_build.py      # 22 assertions, build/drift/link tooling
 python3 tests/test_methodology.py # 31 assertions, onboarding-module guards
 python3 tests/test_interview.py   # per-device interview tool: plan/answer/fill/reask rules
@@ -363,9 +394,14 @@ python3 tests/test_interview.py   # per-device interview tool: plan/answer/fill/
 - **Phase 2 — this repo: engine v2, template library, worked example, tests**
 - **Phase 3 (in progress) — dual-harness packaging: done (one authoring
   source generates the OpenClaw root artifact and the Hermes tap artifact,
-  drift-gated in CI). Still open: the OpenClaw runtime shims — the argv gate
-  wrapper, the Tailscale guard, delivery scripts, consent routing — listed
-  concretely in `references/example-cranston/NOTES.md`.**
+  drift-gated in CI). The OpenClaw runtime shims ship:
+  `scripts/gates/secure-bash-argv.sh` (the argv gate wrapper for a
+  one-shell-string secure-bash), `scripts/bin/tailscale-running.sh` (the
+  `ALT_GUARD_CMD` for a tailnet second transport), and delivery —
+  `scripts/bin/notify-alerts.sh` drains the `send-alert.sh` queue every
+  minute through `scripts/bin/send-telegram.sh`. Still open: an installer,
+  and consent routing (the engine carries `consent` on ask-first proposals;
+  the household-announce channel is not built).**
 - **Phase 4 (in progress) — onboarding methodology: shipped.** Four runnable
   modules under `references/` — `discovery.md` (D1–D9 probes), `interview.md`
   (U1–U17), `failure-modes.md` (F1–F20 audits), `doctrine.md` (the house

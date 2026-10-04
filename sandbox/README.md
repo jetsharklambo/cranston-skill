@@ -24,6 +24,11 @@ The sandbox config (`overlay/services.sandbox.json`) shortens timings
 (verify delay 1s, recovery hold 1 min, no post-outage grace) so drills run
 fast, and pages go to `deploy/state/outbox.log` instead of Telegram.
 
+Alert *delivery* is not exercised here: the sandbox sink writes to
+`deploy/state/outbox.log`, so the queue → drainer → sender contract
+(`bin/send-alert.sh`, `bin/notify-alerts.sh`, `bin/send-telegram.sh`) is
+covered by the offline `tests/test_delivery.sh` instead.
+
 ## Drills (`drill.sh`)
 
 1. All healthy → no pages.
