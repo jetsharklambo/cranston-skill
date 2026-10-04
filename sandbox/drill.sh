@@ -21,6 +21,14 @@ silent()  { [ ! -s "$OUT" ]; }
 scene()   { echo; echo "### $*"; fresh; }
 
 scene "1. all healthy"
+# clean slate: the engine remembers held recoveries and realert windows (either
+# would mute the pages the later scenes assert on), and each remediation counts
+# its own EXEC lines in audit.log and refuses past 3 in 6h - right for a home,
+# wrong for a drill that restarts the same service every minute
+rm -f "$ST/state.json" "$ST/pending-approvals.json" "$ST/digest.jsonl" "$ST/audit.log"
+svcctl start media-server; svcctl start nas
+svcctl plug 192.168.1.1; svcctl plug 192.168.1.58; svcctl plug 127.0.0.1
+fresh
 cycle
 ok "no pages"                          'silent'
 ok "state.json written, no failing keys" '[ -f "$ST/state.json" ] && [ "$(status media-server)" = None ]'

@@ -9,17 +9,69 @@ and actuators you found. Every answer maps to concrete config (vocabulary:
 [services.schema.md](services.schema.md)) or to a line in the house doctrine
 ([doctrine.md](doctrine.md)).
 
-Two delivery styles — the admin picks:
+Three ways to run it — and the default is none of them: a hand-written
+`services.json` is complete without any interview, and nothing below starts
+unasked.
 
-- **One onboarding conversation.** All 17 in a sitting, ~30 minutes. Best when
-  the deployment is new and nothing is paging yet.
-- **One question per daily digest.** Append the next unanswered question to
-  the evening summary until the set is done. Best when the system is already
-  live — answers arrive grounded in that day's actual alerts.
+- **Per device, only the gaps** (the default when the admin *does* ask).
+  `scripts/onboard/interview.py` reads the config, ranks the devices that
+  still have an open decision, and asks one device-shaped question at a
+  time. Re-interview one device, never the whole house. Next section.
+- **One onboarding conversation.** All 17 in a sitting, ~30 minutes, for an
+  admin who wants the whole picture mapped before writing any config. The
+  house-level questions (U4, U6, U7, U11, U12, U14–U17) only exist here.
+- **One question per daily digest.** `interview.py next --digest <file>`
+  appends the next open device question to the evening summary; house-level
+  questions go in by hand. Answers arrive grounded in that day's alerts.
 
 Record answers verbatim before translating. The doctrine quotes the admin;
 the config implements them. Each section below ends with the reference
 deployment's answer as the worked example.
+
+## Running it per device (`scripts/onboard/interview.py`)
+
+The tool knows each shipped check template's finding codes and their layer
+(`scripts/onboard/catalog.json`), so it can tell what is still *open* on a
+device: a code with no `remediations` entry, an ask-first entry with no
+`consent`, a chronic code with no nag cadence, a device the live state shows
+failing for a week. An explicit `null` is a decision (tell-only); an absent
+code is not — the engine treats both as watch-only, so an undecided device
+is safe while it waits.
+
+| Kind | Asks | Applies when | Answer grammar | Maps to |
+|---|---|---|---|---|
+| `retire` | U13 | the live state shows the device failing ≥ 7 days | `retire` / `keep` | `enabled: false`; the retirement list |
+| `class` | U1 | a fixable code (service/state layer) has no decision | `fix` / `ask` / `tell` | `remediations.<code>`; unfixable layers → `null` |
+| `how` | U1 | class is fix/ask and no fix is chosen | `systemd:<unit>` / `docker:<container>` (ask-first only) / `ha:<switch>` / `script:<path>` / `none` | the fix on every fixable code, plus the params its template needs |
+| `host` | U1, U2 | the check can report a host-layer code and a host address is in params | `ha:<switch>` / `script:<path>` (both ask-first) / `none` / `severs` | an ask-first entry, `null`, or a recorded omission (on-demand class; never-touch list) |
+| `consent` | U10 | an ask-first entry lacks `consent` | `admin` / `named:<person>` / `household` | `consent` on each ask-first entry, `consent_notes` |
+| `drill` | U3 | the device has a fix | `freely` / `ok` / `never` | the doctrine only |
+| `nag` | U5 | a chronic (degraded) code has no `realert_minutes_by_code` | `daily` / `hourly` / `digest` | 1440 / 60; `notify_by_code: digest` |
+
+Ranking (`plan`): failing or awaiting approval right now › failing for a
+week › a shipped remediation fits the device type › no fix/ask/tell decision
+› an ask-first fix with no consent scope › its host can go dark › chronic
+codes at the default cadence. Within one device: retire, class, how, host,
+consent, drill, nag.
+
+Rules the tool enforces:
+
+- **Manual config wins.** `fill` writes `services.draft.json` unless
+  `--apply`; it writes only fields nobody decided, and reports a hand-set
+  field it disagrees with as *kept*. Every field it writes is stamped in the
+  service's `_interview` map together with the value written, so a field the
+  admin later hand-edits is the admin's again.
+- **Per device, re-askable.** `reask <device>` archives that device's
+  answers (never deleted — the doctrine quotes them) and reopens the
+  questions the interview itself once settled; the next `fill --apply`
+  replaces those fills and nothing else. `fill --device D --overwrite` does
+  the same for a device whose answer simply changed.
+- **Verbatim.** The keyword at the front of an answer is what maps; the rest
+  of the admin's words are kept for the doctrine and `consent_notes`.
+- **Honest about fixes.** Nothing that cuts power is offered for the auto
+  class; the docker template is ask-first only (the container is its one
+  pinned argument); an HA fix is `turn_on` only; a bespoke check's codes must
+  be listed by hand (the tool still asks about consent and drills on it).
 
 ## U1. Act, ask, or tell
 

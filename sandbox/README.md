@@ -32,6 +32,28 @@ fast, and pages go to `deploy/state/outbox.log` instead of Telegram.
 4. **Network gate**: router unplugged → remote services skipped as unknowable, no pages, no failure counted.
 5. **Watch-only**: media host unplugged → `HOST_DOWN` page, no fix; recovery ✅ held, then released (`--full`).
 
+## Interview drill (`interview-drill.sh`)
+
+The per-device interview, end to end, against a *hand-written* config with
+gaps (the sandbox config minus every remediation decision):
+
+1. `plan` ranks the devices with open decisions and says why.
+2. `nas` goes down → it jumps to the top ("failing now"), and `next` asks its
+   class question with its own port in the text.
+3. The admin answers device by device, in their own words.
+4. `fill` writes a draft; `fill --apply` writes `services.json` (backup kept)
+   with the mappings: ask-first + consent for `nas`, auto for `media-server`,
+   `HOST_DOWN` tell-only, nag cadences.
+5. The filled config drives the engine: `media-server` is auto-fixed, `nas`
+   pages with the household heads-up and waits for `approve-heal.py`.
+6. `reask nas` reopens only that device; its answer changes to tell-only and
+   the engine now only tells.
+7. A field the admin hand-edited survives `--overwrite`.
+8. The doctrine draft quotes the answers.
+
+It restores the full sandbox config afterwards; `--keep` leaves the
+interview-filled config and `interview.json` in place to poke at.
+
 ## Poke it by hand
 
 ```bash

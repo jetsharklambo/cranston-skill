@@ -1,0 +1,175 @@
+{
+  "_about": "Device-type knowledge for onboard/interview.py: what each shipped check template can emit, which layer each code lives at (decides which questions apply and what 'tell' means), and which shipped remediations a device can be wired to. tests/test_interview.py keeps the code lists in step with the templates' '# Findings:' headers.",
+
+  "layers": {
+    "service":    "the service itself is down - a restart-type fix can apply",
+    "state":      "an entity is in the wrong state - a fail-safe turn_on can apply",
+    "host":       "the host is dark - only a power actuator could act, and only ask-first",
+    "chronic":    "degraded: known-broken, only the admin can clear it; nags at a cadence",
+    "credential": "a token/cert problem only a human can refresh",
+    "upstream":   "outside the house (WAN) - nothing here can fix it",
+    "hardware":   "software cannot fix a dead outlet or an unplugged disk",
+    "sensor":     "the sensor went blind - page, never act on a blind value",
+    "inventory":  "something changed on the LAN - a human decides if that is fine"
+  },
+  "fixable_layers": ["service", "state"],
+
+  "templates": {
+    "checks/templates/check-http.sh": {
+      "target": ["HTTP_URL"],
+      "host_param": "HOST_IP",
+      "codes": {
+        "AUTH_FAILED": "credential",
+        "API_ERROR": "service",
+        "SERVICE_DOWN": "service",
+        "HOST_DOWN": "host",
+        "LAN_UNREACHABLE": "chronic",
+        "TRANSPORT_BLIND": "chronic"
+      }
+    },
+    "checks/templates/check-tcp-port.sh": {
+      "target": ["TCP_HOST", "TCP_PORT"],
+      "host_param": "TCP_HOST",
+      "codes": {
+        "PORT_CLOSED": "service",
+        "HOST_DOWN": "host"
+      }
+    },
+    "checks/templates/check-dns.sh": {
+      "target": ["RESOLVER_IP"],
+      "codes": {
+        "DNS_DOWN": "service",
+        "UPSTREAM_DOWN": "upstream"
+      }
+    },
+    "checks/templates/check-systemd-unit.sh": {
+      "target": ["UNIT"],
+      "default_fix": {"kind": "systemd", "from_param": "UNIT"},
+      "codes": {
+        "UNIT_INACTIVE": "service",
+        "PORT_DEAD": "service",
+        "WEDGED": "service"
+      }
+    },
+    "checks/templates/check-disk-space.sh": {
+      "target": ["MOUNT_PATH"],
+      "codes": {
+        "VOLUME_ABSENT": "hardware",
+        "MARKER_MISSING": "hardware",
+        "VOLUME_READONLY": "hardware",
+        "LOW_SPACE": "chronic"
+      }
+    },
+    "checks/templates/check-cert-expiry.sh": {
+      "target": ["CERT_FILE", "CERT_HOST"],
+      "codes": {
+        "CERT_EXPIRED": "credential",
+        "CERT_EXPIRING": "chronic",
+        "CERT_UNREADABLE": "credential"
+      }
+    },
+    "checks/templates/check-ha-entity.sh": {
+      "target": ["ENTITY_ID"],
+      "default_fix": {"kind": "ha"},
+      "codes": {
+        "ENTITY_BLIND": "sensor",
+        "VALUE_CRITICAL": "state",
+        "VALUE_LOW": "state",
+        "STATE_MISMATCH": "state"
+      }
+    },
+    "checks/templates/check-host-power.sh": {
+      "target": [],
+      "target_text": "this box's own power supply",
+      "codes": {
+        "ON_EXTERNAL_POWER_LOST": "hardware",
+        "INTERNAL_BATTERY_LOW": "hardware",
+        "HOST_POWER_UNREADABLE": "hardware"
+      }
+    },
+    "checks/templates/check-lan-inventory.sh": {
+      "target": ["INVENTORY_FILE"],
+      "codes": {
+        "SELF_IP_CHANGED": "inventory",
+        "DEVICE_CHANGED": "inventory",
+        "HOST_UNREACHABLE": "inventory",
+        "CHECK_ERROR": "inventory"
+      }
+    }
+  },
+
+  "fixes": {
+    "systemd": {
+      "script": "remediations/templates/restart-systemd-unit.sh",
+      "params": {"UNIT": "{value}"},
+      "classes": ["fix", "ask"],
+      "what": "restart systemd unit '{value}' on this box"
+    },
+    "docker": {
+      "script": "remediations/templates/restart-docker-container.sh",
+      "params": {"ALLOWED_CONTAINERS": "{value}"},
+      "arg": "{value}",
+      "classes": ["ask"],
+      "refuse": "the docker template takes the container as its single argument, which only an ask-first entry can pin - answer 'ask', or wrap it in a fixed-content script (script:<path>) for the auto class",
+      "what": "restart local docker container '{value}'"
+    },
+    "ha": {
+      "script": "remediations/templates/ha-service-call.sh",
+      "params": {"HA_ENTITY": "{value}"},
+      "needs": ["HA_URL", "HA_TOKEN_FILE"],
+      "classes": ["fix", "ask"],
+      "what": "Home Assistant turn_on of '{value}' (fail-safe direction only)"
+    },
+    "script": {
+      "script": "{value}",
+      "params": {},
+      "classes": ["fix", "ask"],
+      "what": "your own fixed-content script '{value}'"
+    }
+  },
+
+  "questions": {
+    "retire": {
+      "u": "U13",
+      "ask": "{name} has been {status} since {since} and nothing has been done about it - is it retired, or still wanted?",
+      "accepts": "retire | keep  (then your words)",
+      "maps_to": "enabled: false (retire) - the doctrine retirement list either way"
+    },
+    "class": {
+      "u": "U1",
+      "ask": "When {name} breaks ({target}; it can report {codes}), do I fix it silently, ask you first, or just tell you?",
+      "accepts": "fix | ask | tell  (then your words)",
+      "maps_to": "remediations.<code> for its fixable codes ({fixable}); every other code becomes tell-only (null)"
+    },
+    "how": {
+      "u": "U1",
+      "ask": "How would I fix {name}? {options}",
+      "accepts": "systemd:<unit> | docker:<container> (ask-first only) | ha:<switch entity> (turn_on only) | script:<path to your fixed-content script> | none (tell you instead)",
+      "maps_to": "remediations.<code> for {fixable}, plus the params the chosen template needs (REMEDIATION_KEY and the target)"
+    },
+    "host": {
+      "u": "U1 U2",
+      "ask": "If {name}'s host ({host}) goes dark, is there a power actuator I may use - always ask-first - or would acting cut the channel you'd answer me on?",
+      "accepts": "ha:<switch entity> (turn it ON) | script:<path> | none (just tell you) | severs (never auto-propose; on-demand only)",
+      "maps_to": "remediations.{hostcodes}: an ask-first entry, null, or a recorded omission (on-demand class) that also goes on the doctrine never-touch list"
+    },
+    "consent": {
+      "u": "U10",
+      "ask": "Whose evening does acting on {name} ruin - just yours, one specific person's, or the whole household's?",
+      "accepts": "admin | named:<person> | household  (then who/why in your words)",
+      "maps_to": "consent on each ask-first entry, consent_notes on the service"
+    },
+    "drill": {
+      "u": "U3",
+      "ask": "May I test-cycle {name}'s fix to prove it works - freely, only with your explicit OK each time, or never?",
+      "accepts": "freely | ok | never  (then your words)",
+      "maps_to": "the doctrine drill policy (the engine has no drill knob; each remediation's own rate cap backstops it)"
+    },
+    "nag": {
+      "u": "U5",
+      "ask": "When {name} is broken in a way only you can fix ({chronic} - a router setting, a cable, a renewal), how often do I remind you?",
+      "accepts": "daily | hourly | digest (evening summary only)",
+      "maps_to": "realert_minutes_by_code (1440 / 60) and notify_by_code: digest for {chronic}"
+    }
+  }
+}

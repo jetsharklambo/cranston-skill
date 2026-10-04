@@ -25,7 +25,7 @@ and platform facts: `docs/dual-skill-spec.md`.
    documented runtime difference requires it.
 3. `python3 tools/build.py`
 4. `python3 tools/check_drift.py && python3 tools/validate_links.py`
-5. `python3 tests/test_engine.py && bash tests/test_templates.sh && python3 tests/test_build.py`
+5. `python3 tests/test_engine.py && bash tests/test_templates.sh && python3 tests/test_build.py && python3 tests/test_interview.py`
 6. Report changed behavior, generated artifacts, test results, and any
    unresolved platform differences.
 

@@ -32,6 +32,7 @@ is not, and batches the rest into one daily digest.
 | Check templates (9) | `{{SKILL_DIR}}/scripts/checks/templates/` |
 | Remediation templates | `{{SKILL_DIR}}/scripts/remediations/templates/` |
 | Approval-gate templates + interview | `{{SKILL_DIR}}/scripts/gates/`, `{{SKILL_DIR}}/references/approval-gates.md` |
+| Per-device interview (fills gaps in a hand-written config) | `{{SKILL_DIR}}/scripts/onboard/` |
 | Onboarding methodology (index) | `{{SKILL_DIR}}/references/methodology.md` |
 | Discovery probes (D1–D9) | `{{SKILL_DIR}}/references/discovery.md` |
 | Priority-of-needs interview (U1–U17) | `{{SKILL_DIR}}/references/interview.md` |
@@ -110,17 +111,40 @@ is not, and batches the rest into one daily digest.
 
 ### Onboard a home (the methodology)
 
-When the user asks Cranston to learn their home — or before writing a
-`services.json` from scratch — run the four-module flow (index:
-`{{SKILL_DIR}}/references/methodology.md`):
+A hand-written `services.json` is the default: the Install procedure above
+is complete without any interview, and the config the admin writes is the
+source of truth. The flow below is for when the admin asks Cranston to learn
+the home, or would rather be *asked* than fill in fields by hand (index:
+`{{SKILL_DIR}}/references/methodology.md`). Never start it unasked.
 
 1. **Discover** (`{{SKILL_DIR}}/references/discovery.md`): run the D1–D9
    read-only probes, ask the per-category questions, and fill the inventory
    draft. Probes only observe; nothing is changed.
-2. **Interview** (`{{SKILL_DIR}}/references/interview.md`): ask U1–U17 — the
-   values calls no probe can answer — either as one conversation or one
-   question per daily digest, the admin's choice. Each answer maps to named
-   config fields.
+2. **Interview — per device, only the gaps** (`{{SKILL_DIR}}/scripts/onboard/`;
+   the question catalogue and what each answer maps to:
+   `{{SKILL_DIR}}/references/interview.md`). The tool reads every device in
+   the admin's `services.json`, ranks which ones need a decision first
+   (failing right now › failing for a week › a shipped fix fits › no
+   fix/ask/tell chosen › an ask-first fix with no consent scope › chronic
+   codes with no nag cadence), and hands you ONE device-shaped question at a
+   time. Relay it verbatim; record the admin's words verbatim (the keyword at
+   the front is what maps). Re-interview one device, never the whole house.
+
+   ```bash
+   python3 "$DEPLOY/onboard/interview.py" plan                   # ranked devices + why
+   python3 "$DEPLOY/onboard/interview.py" next                   # one question (--device <name> to pick)
+   python3 "$DEPLOY/onboard/interview.py" answer <device> <kind> "<the admin's words>"
+   python3 "$DEPLOY/onboard/interview.py" fill                   # the diff, written to services.draft.json
+   python3 "$DEPLOY/onboard/interview.py" fill --apply           # write services.json (backup kept)
+   python3 "$DEPLOY/onboard/interview.py" reask <device>         # reopen ONE device's questions
+   python3 "$DEPLOY/onboard/interview.py" doctrine               # draft the doctrine sections the answers cover
+   ```
+
+   `fill` never overwrites a field the admin set by hand; it may revise only
+   its own earlier fills, and only on a device under `reask` (or named with
+   `--device <name> --overwrite`). After `--apply`, verify with a `--once`
+   cycle. The house-level questions in `interview.md` (alert budget,
+   dark-house channel, paying for reliability) are conversation-only.
 3. **Audit** (`{{SKILL_DIR}}/references/failure-modes.md`): walk F1–F20
    against the inventory; each hit becomes a service entry, a scheduled
    audit, or a line in the doctrine's standing hands-on list.
@@ -198,6 +222,10 @@ heads-up before approving, not after.
 
 - **Nothing pages on the first bad cycle** — anti-flap needs two consecutive
   failures (~4 min at the */2 cadence). That's by design; don't "fix" it.
+- **Manual config wins.** A finding code absent from `remediations` is
+  watch-only to the engine and *undecided* to the interview; an explicit
+  `null` is a decision. The interview reports a hand-set field it disagrees
+  with as kept — it never changes it.
 - **A recovery ✅ is held ~10 minutes** so a flapping service collapses into
   one message with a flap count instead of a page per bounce.
 - **Blind is not down.** When the default gateway is unreachable, remote
@@ -212,9 +240,12 @@ heads-up before approving, not after.
 - `python3 "$DEPLOY/engine/selfheal.py" --once` exits 0 and writes `state/`.
 - Forced-failure drill: break one target on purpose, run two cycles, watch
   the page arrive; fix it and run cycles until the held ✅ releases.
-- The repository's offline suites pass: `python3 tests/test_engine.py` and
-  `bash tests/test_templates.sh` (run from a checkout; they are not shipped
-  in the skill package).
+- After an interview: `python3 "$DEPLOY/onboard/interview.py" plan` reports
+  nothing to ask and `fill` reports nothing to fill, and a `--once` cycle on
+  the filled config exits 0.
+- The repository's offline suites pass: `python3 tests/test_engine.py`,
+  `bash tests/test_templates.sh` and `python3 tests/test_interview.py` (run
+  from a checkout; they are not shipped in the skill package).
 - If any of this cannot be verified (no cron access, sink undeliverable),
   report exactly what was and wasn't confirmed — never claim a watch that
   isn't running.

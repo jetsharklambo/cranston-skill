@@ -5,7 +5,10 @@ set -u
 LIB="${SELFHEAL_ROOT:-$(cd "$(dirname "$0")/.." && pwd)}/engine/lib"
 . "$LIB/remediation.sh"
 
-TARGET="${1:-${FAKE_SVC:-}}"
+# the one argument, else the FAKE_SVC param, else the service key itself (a
+# config the interview wrote carries REMEDIATION_KEY, and in the sandbox the
+# service key IS the fake service's name)
+TARGET="${1:-${FAKE_SVC:-${REMEDIATION_KEY:-}}}"
 rem_begin "${REMEDIATION_KEY:-$TARGET}" "restart-fake-service"
 rem_cap "${CAP_MAX:-3}" "${CAP_WINDOW_H:-6}"
 case "$TARGET" in media-server|nas) ;; *) rem_refuse "unknown sandbox service '$TARGET'" ;; esac

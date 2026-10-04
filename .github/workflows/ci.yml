@@ -26,6 +26,9 @@ jobs:
       - name: Methodology module guards
         run: python3 tests/test_methodology.py
 
+      - name: Per-device interview tool
+        run: python3 tests/test_interview.py
+
       - name: Engine suite
         run: python3 tests/test_engine.py
 

@@ -175,6 +175,13 @@ the failure-mode audit library, and the house doctrine template) an agent
 walks to produce a draft `services.json` and doctrine for you to review.
 Probes only observe, and nothing generated takes effect until you've read it.
 
+Writing `services.json` by hand is the default; the interview is opt-in and
+per device. `scripts/onboard/interview.py` reads the config you wrote, ranks
+the devices that still have an open decision (failing right now first), asks
+one device-shaped question at a time, fills in only what you left blank, and
+can re-interview a single device later. `sandbox/interview-drill.sh` runs the
+whole loop against a fake LAN.
+
 ## First deployment
 
 What a first install looks like today, honestly: the **core is standalone-able**
@@ -345,6 +352,7 @@ python3 tests/test_engine.py     # 60 assertions, isolated temp install
 bash tests/test_templates.sh     # 51 assertions, offline (local stub servers)
 python3 tests/test_build.py      # 22 assertions, build/drift/link tooling
 python3 tests/test_methodology.py # 31 assertions, onboarding-module guards
+python3 tests/test_interview.py   # per-device interview tool: plan/answer/fill/reask rules
 ```
 
 ## Status / roadmap
@@ -363,4 +371,7 @@ python3 tests/test_methodology.py # 31 assertions, onboarding-module guards
   (U1–U17), `failure-modes.md` (F1–F20 audits), `doctrine.md` (the house
   doctrine template) — indexed by `references/methodology.md`, so an agent can
   learn a home conversationally and draft `services.json` + a doctrine for the
-  admin to review. Still open: registry publication.
+  admin to review. The interview module is runnable:
+  `scripts/onboard/interview.py` fills the gaps in a hand-written config per
+  device, ranked by what a wrong default would cost, and is re-askable per
+  device. Still open: registry publication.
