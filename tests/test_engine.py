@@ -12,7 +12,10 @@ path resolution, pluggable alert_sink / approval_gate argv edges, blind-root
 suppression, config-driven TTL, consent carriage. Groups 22-26 cover the
 hardening: approve-heal strips the automation marker and GATE_* from its
 inherited env, reserved params keys, finding-key validation, remediation
-argument sanitization, and first_failed_at in state.
+argument sanitization, and first_failed_at in state. Groups 27-29 cover the
+cycle-survival fixes: the per-service error boundary (_errors, CHECK_ERROR)
+and ENGINE_DEFAULTS, escalated re-nags renewing their pending approval, and a
+failed alert sink being retried next cycle (_sink) instead of lost.
 
 Run anywhere: python3 tests/test_engine.py
 """
@@ -621,6 +624,183 @@ ok(rec["first_failed_at"] == t0, "first_failed_at did not move")
 hs.step(SVC_IMMEDIATE, "svcA", None)
 ok("first_failed_at" not in rec, "cleared when the key steps healthy")
 ok("first_failed_at" not in sh.default_record(), "not in default_record: old state files load unchanged")
+
+# Groups 27-29 drive full run() cycles; the network gate is stubbed UP so no
+# probe runs (and the "ip" binary's presence on the test box stops mattering).
+real_lnu = sh.local_network_up
+sh.local_network_up = lambda g=None: (True, g)
+
+print("== 27. per-service error boundary: one bad service no longer kills the cycle ==")
+svc_1 = {"name": "svc1", "enabled": True, "local": True, "check": "unused", "remediations": {}}
+svc_2 = dict(svc_1, name="svc2")
+svc_3 = dict(svc_1, name="svc3")
+cfg27 = json.loads(json.dumps(CONFIG)); cfg27["services"] = [svc_1, svc_2, svc_3]
+hs = fresh(cfg27)
+hs.state = {"keys": {}}
+down = {"status": "X_DOWN", "layer": "l", "detail": "down"}
+def boom_check(svc):
+    if svc["name"] == "svc2":                   # the middle one blows up
+        raise RuntimeError("boom in the middle")
+    return {svc["name"]: dict(down)}
+hs.run_check = boom_check
+logged = []
+real_log = sh.log
+sh.log = lambda m: logged.append(m)
+hs.run()                                        # used to die here: nothing saved, nothing paged
+sh.log = real_log
+ok(all(hs.state["keys"][k]["consecutive_failures"] == 1 for k in ("svc1", "svc3")),
+   "the services on either side of the failing one were stepped")
+errs = [m for m in logged if m.startswith("ERROR svc2:")]
+ok(len(errs) == 1 and errs[0].startswith("ERROR svc2: RuntimeError: boom in the middle"),
+   "one ERROR line names the service and the exception (no traceback spam)")
+err = hs.state["_errors"]["svc2"]
+ok("RuntimeError" in err["error"] and "boom in the middle" in err["error"] and err["at"] == sh.iso(clock.t),
+   "_errors names the failing service with the exception text")
+saved = json.loads((tmp / "state" / "state.json").read_text())
+ok(saved["_errors"]["svc2"]["error"] == err["error"] and saved["keys"]["svc3"]["consecutive_failures"] == 1,
+   "state.json was saved despite the error")
+ok(hs.state["keys"]["svc2"]["last_status_code"] == "CHECK_ERROR" and hs.alerts == [],
+   "the failing service's root key stepped with a synthesized CHECK_ERROR (absorbing, 1/2)")
+hs.run()                                        # second failing cycle: threshold reached
+ok(any("svc2 DOWN" in a and "layer: selfheal" in a and "engine error while processing this service" in a
+       and "RuntimeError: boom in the middle" in a for a in hs.alerts),
+   "after fail_threshold cycles the failing service pages the engine error (CHECK_ERROR at layer selfheal)")
+ok(len(hs.alerts) == 3, "svc1 and svc3 paged their own DOWN in the same cycle")
+hs.run_check = lambda svc: {}
+hs.run()                                        # a clean cycle
+ok("_errors" not in hs.state, "a clean cycle clears the service's _errors entry (table dropped when empty)")
+# an unexpected record shape is caught the same way, even though the broken
+# record also defeats the synthesized CHECK_ERROR step (logged, not raised)
+hs.run_check = lambda svc: {svc["name"]: dict(down)}
+hs.state["keys"]["svc3"] = "garbage"
+before = hs.state["keys"]["svc1"]["consecutive_failures"]
+logged = []
+sh.log = lambda m: logged.append(m)
+hs.run()
+sh.log = real_log
+ok(hs.state["keys"]["svc1"]["consecutive_failures"] == before + 1
+   and "AttributeError: 'str' object" in hs.state["_errors"]["svc3"]["error"]
+   and any(m.startswith("ERROR svc3: could not record the engine error either") for m in logged),
+   "a garbage state record is boxed in too; the cycle and the other services complete")
+hs.state = {"keys": {}}
+sh.save_json(hs.state_file, hs.state)           # don't leak the garbage to later groups
+# a minimal config: "defaults": {} (and no defaults block at all) must not KeyError
+cfgmin = {"version": 2, "paths": {}, "defaults": {}, "services": [svc_1]}
+hs = fresh(cfgmin)
+hs.state = {"keys": {}}
+hs.run_check = lambda svc: {"svc1": dict(down)}
+hs.run(); hs.run()
+ok(any("svc1 DOWN" in a for a in hs.alerts) and "_errors" not in hs.state,
+   "a config whose defaults is {} runs and pages without KeyError (ENGINE_DEFAULTS)")
+ok(hs.opt(svc_1, "check_timeout_seconds") == 45 and hs.pending_ttl_hours == 6 and hs.grace_minutes == 6,
+   "the documented defaults fill the gaps")
+del cfgmin["defaults"]
+hs = fresh(cfgmin)
+ok(hs.default("fail_threshold") == 2 and hs.opt({"fail_threshold": 5}, "fail_threshold") == 5,
+   "no defaults block at all: engine default, and the service's own value still wins")
+ok(fresh().opt({}, "check_timeout_seconds") == 5, "the config's defaults block beats ENGINE_DEFAULTS")
+ok(sh.ENGINE_DEFAULTS == {"fail_threshold": 2, "check_timeout_seconds": 45, "cooldown_minutes": 30,
+                          "max_attempts": 2, "attempt_window_hours": 6, "verify_delay_seconds": 45,
+                          "realert_minutes": 60, "recovery_hold_minutes": 10, "pending_ttl_hours": 6,
+                          "ask_demote_after": 3, "post_outage_grace_minutes": 6},
+   "ENGINE_DEFAULTS carries exactly the values services.schema.md documents")
+
+print("== 28. escalated re-nag renews the pending approval it asks for ==")
+hs = fresh()
+hs.config["services"] = [SVC_AUTO_PAGE]
+hs.state = {"keys": {}}; hs.pending = {}
+hs.run_remediation = lambda svc, script, arg: (1, "boom")
+fsub = {"key": "svcE/ctr-1", "status": "CODE_AUTO2", "layer": "l", "detail": "down"}
+hs.run_check = lambda svc: {"svcE/ctr-1": dict(fsub)}
+hs.run(); hs.run()                              # confirm (threshold 2) + attempt 1
+clock.advance(31); hs.run()                     # attempt 2 (cooldown 30)
+clock.advance(31); hs.run()                     # cap -> escalated, pending created
+rec = hs.state["keys"]["svcE/ctr-1"]
+ok(rec["status"] == "escalated" and hs.pending["svcE/ctr-1"]["arg"] == "ctr-1",
+   "cap reached: escalated, the pending approval carries the subkey as its arg")
+exp_cap = hs.pending["svcE/ctr-1"]["expires"]
+clock.advance(6 * 60 + 61)                      # past pending_ttl_hours AND the realert window
+ok(sh.parse_iso(exp_cap) < clock.t, "(the cap's approval has lapsed by now)")
+n = len(hs.alerts)
+hs.run()                                        # still failing -> STILL DOWN re-nag
+ok(len(hs.alerts) == n + 1 and "STILL DOWN" in hs.alerts[-1] and "heal svcE/ctr-1" in hs.alerts[-1],
+   "the escalated re-nag fired")
+pend = hs.pending.get("svcE/ctr-1")
+ok(pend is not None and sh.parse_iso(pend["expires"]) > clock.t,
+   "the re-nag renewed the pending approval: expiry is in the future again")
+ok(pend["script"] == "/x/auto.sh" and pend["status_code"] == "CODE_AUTO2" and pend["arg"] == "ctr-1",
+   "renewed with the same script, code and argument the cap proposed")
+ok(json.loads((tmp / "state" / "pending-approvals.json").read_text())["svcE/ctr-1"]["expires"] == pend["expires"],
+   "the renewed entry survived expire_pending and reached disk")
+clock.advance(6 * 60 + 61); hs.run()            # and again on the next re-page
+ok("STILL DOWN" in hs.alerts[-1] and sh.parse_iso(hs.pending["svcE/ctr-1"]["expires"]) > clock.t,
+   "renewed on every re-page, for as long as the admin keeps being paged")
+# the awaiting_approval re-page already renews an ask-first entry (group 3);
+# a watch-only (null) remediation must never create one
+hs = fresh()
+hs.state = {"keys": {}}; hs.pending = {}
+hs.step(SVC_IMMEDIATE, "svcA", fp)
+hs.step(SVC_IMMEDIATE, "svcA", fp)              # DOWN page
+clock.advance(61)
+hs.step(SVC_IMMEDIATE, "svcA", fp)              # re-page
+ok(len(hs.alerts) == 2 and hs.pending == {}, "a watch-only re-page never creates a pending entry")
+
+print("== 29. a failed alert sink is retried next cycle, not lost ==")
+clear_digest()
+sink29 = tmp / "sink29-out.txt"
+sink_fail = write_exec(tmp / "bin" / "failing-sink.sh",
+                       f'#!/bin/bash\nprintf "%s\\n" "$@" > "{sink29}"\n'
+                       f'echo "state_dir=$SELFHEAL_STATE_DIR" >> "{sink29}"\n'
+                       'echo "bot API said 502" >&2\nexit 1\n')
+sink_ok = write_exec(tmp / "bin" / "ok-sink.sh", f'#!/bin/bash\nprintf "%s\\n" "$@" > "{sink29}"\nexit 0\n')
+cfg29 = json.loads(json.dumps(CONFIG))
+cfg29["paths"] = {"alert_sink": ["bash", sink_fail]}
+cfg29["services"] = [SVC_IMMEDIATE]
+cfg_path.write_text(json.dumps(cfg29))
+hs = sh.SelfHeal(str(cfg_path))                 # real flush_alerts on purpose
+hs.run_hook = lambda svc, k: ""
+hs.state = {"keys": {}}; hs.pending = {}
+hs.run_check = lambda svc: {"svcA": dict(fp)}
+hs.run(); hs.run()                              # confirm -> page -> the sink exits 1
+rec = hs.state["keys"]["svcA"]
+ok(rec["last_alert"] is None, "last_alert restored to its previous value (None) after the sink failed")
+ok(hs.state["_sink"]["consecutive_failures"] == 1 and "502" in hs.state["_sink"]["detail"]
+   and hs.state["_sink"]["last_failure"] == sh.iso(clock.t), "_sink records the failure and the sink's output")
+got = sink29.read_text()
+ok("svcA DOWN" in got and f"state_dir={hs.state_dir}" in got, "the sink saw the page and SELFHEAL_STATE_DIR")
+saved = json.loads((tmp / "state" / "state.json").read_text())
+ok(saved["keys"]["svcA"]["last_alert"] is None and saved["_sink"]["consecutive_failures"] == 1,
+   "the restored stamp is what reached disk (flush runs before the save)")
+ok(hs.alerts == [] and read_digest() == [], "queue drained, nothing written to the digest (no duplicate later)")
+sink29.unlink()
+hs.run()                                        # next cycle: realert_due -> re-sent
+ok(sink29.exists() and "svcA DOWN" in sink29.read_text(), "the lost page was re-sent next cycle")
+ok(hs.state["_sink"]["consecutive_failures"] == 2 and rec["last_alert"] is None, "still failing: count climbs")
+hs.alert_sink = ["bash", sink_ok]
+sink29.unlink()
+hs.run()                                        # the sink works again
+ok(sink29.exists() and "svcA DOWN" in sink29.read_text(), "re-sent again and delivered this time")
+ok(hs.state["_sink"]["consecutive_failures"] == 0 and hs.state["_sink"]["last_success"] == sh.iso(clock.t)
+   and "detail" not in hs.state["_sink"], "_sink reports the recovery")
+ok(rec["last_alert"] == sh.iso(clock.t), "last_alert stays stamped once delivered")
+t_ok = rec["last_alert"]
+clock.advance(61)
+hs.alert_sink = ["bash", sink_fail]
+hs.run()                                        # realert re-page meets a failing sink again
+ok(rec["last_alert"] == t_ok, "a later failure restores the PREVIOUS stamp, not None")
+ok(hs.state["_sink"]["consecutive_failures"] == 1 and hs.state["_sink"]["last_success"] == t_ok,
+   "the failure count restarted after the success; last_success is kept")
+# a digest write that fails pages the line instead - and that page is covered too
+hs.digest_file = tmp / "state" / "state.json" / "digest.jsonl"   # parent is a FILE: mkdir fails
+hs.digest_lock = Path(str(hs.digest_file) + ".lock")
+rec2 = hs.state["keys"].setdefault("svcB", sh.default_record())
+hs.alert(rec2, "⚠️ svcB DEGRADED — digest broken", route="digest", system="svcB")
+ok(hs.alerts == ["⚠️ svcB DEGRADED — digest broken"] and rec2["last_alert"] == sh.iso(clock.t),
+   "a failed digest write pages the line instead")
+hs.flush_alerts()
+ok(rec2["last_alert"] is None and hs.alerts == [], "...and the sink failing un-stamps that page as well")
+
+sh.local_network_up = real_lnu
 
 print(f"\nALL {PASS} ASSERTIONS PASSED")
 shutil.rmtree(tmp)

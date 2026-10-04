@@ -31,6 +31,11 @@ v2 over the proven v1 engine (cranston, 2026-07..10):
   - findings are validated against the service's own key prefix (a subkey IS
     the remediation's argument - ARG_RE), params may not set engine-owned
     names (RESERVED_PARAM_RE), and records carry first_failed_at
+  - a per-service error boundary: one service the engine cannot process
+    (state['_errors'], surfaced as CHECK_ERROR) no longer kills the cycle;
+    a failed alert sink is retried next cycle (state['_sink']) instead of
+    being lost; escalated re-nags renew the pending approval they ask for;
+    missing "defaults" keys fall back to ENGINE_DEFAULTS
 
 Single-instance via cron flock + fcntl lock on <state_dir>/.lock; state writes
 are atomic and shared with approve-heal.py.
@@ -44,6 +49,7 @@ import re
 import subprocess
 import sys
 import time
+import traceback
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -61,6 +67,24 @@ STATUS_RE = r"[A-Z][A-Z0-9_]{0,63}"
 # second factor) and the PATH-like names change what a child process executes
 # or how its interpreter behaves. Keep identical to approve-heal.py's copy.
 RESERVED_PARAM_RE = r"^(SELFHEAL_|GATE_|LD_|BASH_|PYTHON|SHELLOPTS$|PATH$|ENV$|CDPATH$|IFS$|HOME$)"
+
+# The documented tunables (references/services.schema.md) and their defaults.
+# Resolution: the service's own value, then the config's "defaults" block,
+# then this table - a minimal config that leaves a key out used to KeyError
+# the whole cycle the first time the engine reached for it.
+ENGINE_DEFAULTS = {
+    "fail_threshold": 2,
+    "check_timeout_seconds": 45,
+    "cooldown_minutes": 30,
+    "max_attempts": 2,
+    "attempt_window_hours": 6,
+    "verify_delay_seconds": 45,
+    "realert_minutes": 60,
+    "recovery_hold_minutes": 10,
+    "pending_ttl_hours": 6,
+    "ask_demote_after": 3,
+    "post_outage_grace_minutes": 6,
+}
 
 
 def reserved_param(svc):
@@ -211,8 +235,8 @@ class SelfHeal:
         if self.config is None:
             print(f"FATAL: cannot read config {config_path}", file=sys.stderr)
             sys.exit(2)
-        self.defaults = self.config.get("defaults", {})
-        paths = self.config.get("paths", {})
+        self.defaults = self.config.get("defaults") or {}
+        paths = self.config.get("paths") or {}
 
         self.state_dir = resolve(paths.get("state_dir", "state"))
         self.state_file = self.state_dir / "state.json"
@@ -225,24 +249,40 @@ class SelfHeal:
         self.alert_sink = argvify(paths.get("alert_sink", "bin/send-alert.sh"))
         self.approval_gate = argvify(paths.get("approval_gate"))
 
-        self.pending_ttl_hours = self.defaults.get("pending_ttl_hours", 6)
+        self.pending_ttl_hours = self.default("pending_ttl_hours")
         # After the local network comes BACK, hold off on remote services: on
         # mains restore the router answers minutes before the other hosts
         # finish booting - without grace every remote service pages DOWN then
         # "recovered". Env override is test-only.
         self.grace_minutes = int(os.environ.get(
-            "SELFHEAL_GRACE_MINUTES",
-            self.defaults.get("post_outage_grace_minutes", 6)))
+            "SELFHEAL_GRACE_MINUTES", self.default("post_outage_grace_minutes")))
 
         self.alerts = []
+        # (rec, message, last_alert before the page) per queued page, so a
+        # failed sink can un-stamp exactly what it failed to deliver
+        self.pages = []
         self.state_dir.mkdir(parents=True, exist_ok=True)
         self.state = load_json(self.state_file, {"keys": {}})
         self.pending = load_json(self.pending_file, {})
 
     # -- config helpers -----------------------------------------------------
 
+    def default(self, key):
+        """A deployment-wide tunable: the config's "defaults" block, else the
+        documented engine default."""
+        return self.defaults.get(key, ENGINE_DEFAULTS[key])
+
     def opt(self, svc, key):
-        return svc.get(key, self.defaults[key])
+        """A per-service tunable: the service's own value wins over default()."""
+        return svc[key] if key in svc else self.default(key)
+
+    def engine_exports(self):
+        """Where this deployment lives, for every child the engine runs (checks,
+        hooks, remediations, the alert sink). Same three names approve-heal.py
+        exports, so a script finds the same audit log either way."""
+        return {"SELFHEAL_ROOT": str(ROOT),
+                "SELFHEAL_STATE_DIR": str(self.state_dir),
+                "SELFHEAL_AUDIT_LOG": str(self.audit_log)}
 
     def check_env(self, svc):
         """Environment for this service's check, remediations and hooks:
@@ -258,9 +298,7 @@ class SelfHeal:
             env["SELFHEAL_CONTAINERS_AUTO"] = " ".join(svc["containers_auto"])
         if "containers_watch" in svc:
             env["SELFHEAL_CONTAINERS_WATCH"] = " ".join(svc["containers_watch"])
-        env["SELFHEAL_ROOT"] = str(ROOT)
-        env["SELFHEAL_STATE_DIR"] = str(self.state_dir)
-        env["SELFHEAL_AUDIT_LOG"] = str(self.audit_log)
+        env.update(self.engine_exports())  # after params: the exports win
         return env
 
     # -- checks -------------------------------------------------------------
@@ -368,16 +406,21 @@ class SelfHeal:
         """Queue a user-facing message. route='immediate' pages via the alert
         sink this cycle; route='digest' lands in the daily digest instead.
         Both stamp last_alert, so realert_due throttles digest lines exactly
-        like pages."""
+        like pages. A page remembers the stamp it replaced: flush_alerts puts
+        it back if the sink fails, so the page is not throttled away unsent."""
+        prev = rec.get("last_alert")
         rec["last_alert"] = iso(now())
-        if route == "digest":
-            self.digest_line(system, message)
+        if route == "digest" and self.digest_line(system, message):
             log(f"DIGEST: {message}")
-        else:
-            self.alerts.append(message)
-            log(f"ALERT: {message}")
+            return
+        self.alerts.append(message)
+        self.pages.append((rec, message, prev))
+        log(f"ALERT: {message}")
 
     def digest_line(self, system, message):
+        """Append one digest entry under the digest lock. False on failure,
+        and the caller pages the line instead - fail LOUD: a broken digest
+        must not silently eat findings."""
         entry = {"system": system, "message": message, "timestamp": iso(now())}
         try:
             self.digest_file.parent.mkdir(parents=True, exist_ok=True)
@@ -385,18 +428,51 @@ class SelfHeal:
                 fcntl.flock(lk, fcntl.LOCK_EX)
                 with open(self.digest_file, "a") as f:
                     f.write(json.dumps(entry) + "\n")
+            return True
         except Exception as e:
-            # fail LOUD: a broken digest must not silently eat findings
             log(f"WARN: digest write failed ({e}); paging immediately instead")
-            self.alerts.append(message)
+            return False
 
     def flush_alerts(self):
+        """Hand this cycle's pages to the alert sink, with the engine exports
+        in its env so it can find the deployment (SELFHEAL_ALERT_FILE and the
+        rest of the caller's env pass through untouched).
+
+        A sink that exits non-zero, times out or cannot be launched used to
+        lose the page for good: last_alert was already stamped, so the realert
+        throttle treated it as delivered. Now every undelivered page gets its
+        previous stamp back - realert_due fires again next cycle and the state
+        machine re-sends - and state['_sink'] records the failure. The lines
+        are NOT also written to the digest: that retry would duplicate them."""
         if not self.alerts:
             return
+        env = dict(os.environ)
+        env.update(self.engine_exports())
         try:
-            subprocess.run(self.alert_sink + self.alerts, timeout=30, check=False)
+            r = subprocess.run(self.alert_sink + self.alerts, capture_output=True, text=True,
+                               errors="replace", timeout=30, check=False, env=env)
+            rc, out, why = r.returncode, (r.stdout + r.stderr).strip(), f"rc={r.returncode}"
+        except subprocess.TimeoutExpired:
+            rc, out, why = -1, "alert sink timed out after 30s", "timed out after 30s"
         except Exception as e:
-            log(f"WARN: alert sink failed: {e}")
+            rc, out, why = -1, f"{type(e).__name__}: {e}", f"{type(e).__name__}: {e}"
+        sink = self.state.get("_sink")
+        if not isinstance(sink, dict):
+            sink = self.state["_sink"] = {}
+        if rc == 0:
+            if out:
+                log(f"alert sink: {out[:200]}")
+            sink.update(last_success=iso(now()), consecutive_failures=0)
+            sink.pop("detail", None)
+        else:
+            log(f"WARN: alert sink failed ({why}): {len(self.alerts)} alert(s) will be "
+                f"retried next cycle")
+            sink.update(last_failure=iso(now()), detail=out[:200],
+                        consecutive_failures=sink.get("consecutive_failures", 0) + 1)
+            # newest first: a key paged twice this cycle ends on its ORIGINAL stamp
+            for rec, _message, prev in reversed(self.pages):
+                rec["last_alert"] = prev
+        self.alerts, self.pages = [], []
 
     def notify_class(self, svc, code, degraded, has_ask):
         """'immediate' or 'digest' for a finding. Ask-first findings are always
@@ -448,7 +524,7 @@ class SelfHeal:
             rec["ask_code"] = code
             rec["ask_pages"] = 0
         rec["ask_pages"] = rec.get("ask_pages", 0) + 1
-        limit = svc.get("ask_demote_after", self.defaults.get("ask_demote_after", 3))
+        limit = self.opt(svc, "ask_demote_after")
         if limit and rec["ask_pages"] > limit:
             log(f"ask for this key paged {rec['ask_pages'] - 1}x with no approval "
                 f"-> demoting to digest (ask_demote_after={limit})")
@@ -478,8 +554,7 @@ class SelfHeal:
             # window. Flap collapse: recoveries wait recovery_hold_minutes; a
             # re-failure inside the window suppresses the pair and bumps a
             # flap counter that the next real page carries as a suffix.
-            hold = timedelta(minutes=svc.get(
-                "recovery_hold_minutes", self.defaults.get("recovery_hold_minutes", 10)))
+            hold = timedelta(minutes=self.opt(svc, "recovery_hold_minutes"))
             flap = rec.get("flap")
             if flap and flap.get("pending_since"):
                 try:
@@ -549,6 +624,12 @@ class SelfHeal:
 
         if rec["status"] == "escalated":
             if self.realert_due(rec, svc, code):
+                # The approval step_auto created at the cap lapses after
+                # pending_ttl_hours; a re-nag that keeps saying "reply 'heal'"
+                # must renew it or the reply lands on "Nothing pending". Same
+                # script and argument the cap proposed (the code's auto fix).
+                if isinstance(remediation, str):
+                    self.add_pending(key, code, remediation, arg)
                 route = self.demote_ask(rec, svc, code, "immediate")
                 self.alert(rec, f"\U0001f6a8 {key} STILL DOWN ({code}) — auto-restart cap "
                                 f"reached earlier. Reply 'heal {key}' to run the fix."
@@ -706,36 +787,80 @@ class SelfHeal:
                     timedelta(minutes=self.grace_minutes)
                 log(f"POST-OUTAGE GRACE (until {until.strftime('%H:%M:%S')}Z) - remote hosts "
                     f"are still booting; running local-only services {local}; skipped {skipped}")
-        for svc in self.config["services"]:
+        for i, svc in enumerate(self.config["services"]):
             if not svc.get("enabled", True):
                 continue
             if (not net_up or grace) and not svc.get("local"):
                 continue  # skip entirely: don't step the state machine, don't
                           # burn a failure count, and thus emit no spurious
                           # 'recovered' later
-            findings = self.run_check(svc)
-            prefix = svc["name"]
-            known = {k for k in self.state["keys"]
-                     if k == prefix or k.startswith(prefix + "/")}
-            known |= set(findings)
-            # Blind-root suppression: when the service's ROOT key has a
-            # finding (unreachable, daemon down, check error), its subkeys are
-            # unknowable - stepping them healthy fabricates recoveries while
-            # the view is broken. Subkeys that DID produce findings still step.
-            root_blind = prefix in findings
-            skipped_subkeys = 0
-            for key in sorted(known):
-                if root_blind and key != prefix and key not in findings:
-                    skipped_subkeys += 1
-                    continue
-                self.step(svc, key, findings.get(key))
-            if root_blind and skipped_subkeys:
-                log(f"{prefix}: root finding ({findings[prefix]['status']}) - "
-                    f"{skipped_subkeys} subkey(s) skipped as unknowable")
+            # Per-service error boundary: one service the engine cannot
+            # process must not take the others down with it. Before this, any
+            # exception here ended the cycle - nothing saved, nothing paged,
+            # every cron run dying quietly for as long as the cause remained.
+            name = str(svc.get("name") or f"service#{i}")
+            try:
+                self.run_service(svc)
+            except Exception as e:
+                self.service_error(svc, name, e)
+            else:
+                errors = self.state.get("_errors")
+                if isinstance(errors, dict) and errors.pop(name, None) is not None and not errors:
+                    del self.state["_errors"]  # all clear: leave no empty table behind
         self.expire_pending()
-        save_json(self.state_file, self.state)
-        save_json(self.pending_file, self.pending)
-        self.flush_alerts()
+        # The sink runs BEFORE the saves: a failed sink puts last_alert back,
+        # and that un-stamped value is what must reach disk. The saves run
+        # whatever the sink does (the cron lock is held for all of it).
+        try:
+            self.flush_alerts()
+        finally:
+            save_json(self.state_file, self.state)
+            save_json(self.pending_file, self.pending)
+
+    def run_service(self, svc):
+        """One service's share of a cycle: probe it, then step every key it
+        owns through the state machine."""
+        findings = self.run_check(svc)
+        prefix = svc["name"]
+        known = {k for k in self.state["keys"]
+                 if k == prefix or k.startswith(prefix + "/")}
+        known |= set(findings)
+        # Blind-root suppression: when the service's ROOT key has a
+        # finding (unreachable, daemon down, check error), its subkeys are
+        # unknowable - stepping them healthy fabricates recoveries while
+        # the view is broken. Subkeys that DID produce findings still step.
+        root_blind = prefix in findings
+        skipped_subkeys = 0
+        for key in sorted(known):
+            if root_blind and key != prefix and key not in findings:
+                skipped_subkeys += 1
+                continue
+            self.step(svc, key, findings.get(key))
+        if root_blind and skipped_subkeys:
+            log(f"{prefix}: root finding ({findings[prefix]['status']}) - "
+                f"{skipped_subkeys} subkey(s) skipped as unknowable")
+
+    def service_error(self, svc, name, exc):
+        """run()'s boundary handler. Log ONE line (no traceback spam), remember
+        the error in state['_errors'], then step the root key with a
+        synthesized CHECK_ERROR so the admin hears about it through the normal
+        threshold / realert path instead of from a silent cron log."""
+        err = traceback.format_exc().splitlines()[-1][:300]  # "ExcType: msg"
+        frames = traceback.extract_tb(exc.__traceback__)
+        where = (f" (at {Path(frames[-1].filename).name}:{frames[-1].lineno} in {frames[-1].name})"
+                 if frames else "")
+        log(f"ERROR {name}: {err}{where}")
+        try:
+            errors = self.state.get("_errors")
+            if not isinstance(errors, dict):
+                errors = self.state["_errors"] = {}
+            errors[name] = {"at": iso(now()), "error": err}
+            self.step(svc, name, {"status": "CHECK_ERROR", "layer": "selfheal",
+                                  "detail": f"engine error while processing this service: {err}"})
+        except Exception as e:
+            # the record itself may be what is broken: say so, move on
+            log(f"ERROR {name}: could not record the engine error either: "
+                f"{type(e).__name__}: {e}")
 
 
 def main():

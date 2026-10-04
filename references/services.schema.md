@@ -114,6 +114,27 @@ All relative paths resolve against the install root (the directory containing
   current incident began; it survives re-pages (which move `last_transition`),
   is cleared on recovery, and is what the interview's retire question reads to
   ask about a device that has been failing for a week.
+- **Per-service error boundary.** A service the engine itself cannot process
+  (a remediation that cannot be launched, a config or state shape the code
+  did not expect) no longer ends the cycle: the error is logged on one line,
+  recorded under `_errors` in `state.json` (cleared on the next clean cycle),
+  and stepped onto the service's root key as a `CHECK_ERROR` so it pages like
+  any other finding; the other services, the state save and the alert flush
+  all still run. Any `defaults` key left out of the config falls back to the
+  documented default above (service value → `defaults` block → engine default).
+- **Escalated re-nags renew the approval.** Every "STILL DOWN … reply 'heal
+  <key>'" re-page re-creates the pending approval for the code's auto fix, so
+  `heal <key>` keeps working for as long as the admin keeps being paged, not
+  just for `pending_ttl_hours` after the cap was hit. A watch-only re-page
+  never creates a pending entry.
+- **Alert-sink retry.** A sink that exits non-zero, times out (30 s) or cannot
+  be launched does not lose the page: the paged keys get their previous
+  `last_alert` back, so the realert window is open again next cycle and the
+  state machine re-sends; `_sink` in `state.json` records
+  `last_failure`/`consecutive_failures`/`detail` (or `last_success`). The
+  lines are not also written to the digest (the retry would duplicate them).
+  The sink runs with `SELFHEAL_ROOT`, `SELFHEAL_STATE_DIR` and
+  `SELFHEAL_AUDIT_LOG` exported, like checks and remediations.
 
 ## The check contract (for template authors)
 
