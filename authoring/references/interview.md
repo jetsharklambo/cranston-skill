@@ -175,9 +175,9 @@ DOWN headline itself.
 cable — how often do I remind you, and in what tone?"
 **Record:** nag interval and the severity wording the admin will tolerate.
 **Maps to:** `realert_minutes_by_code` (chronic codes at 1440) and
-`"severity": "degraded"` on the finding — ⚠️ DEGRADED headline, digest routing
-by default.
-*Reference deployment:* daily ⚠️ DEGRADED, never hourly 🚨 DOWN.
+`"severity": "degraded"` on the finding — a soft ⚠️ "Heads-up" line, digest
+routing by default.
+*Reference deployment:* a daily ⚠️ heads-up, never an hourly 🚨 page.
 
 ## U6. Energy and charging policy
 

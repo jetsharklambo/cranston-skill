@@ -138,7 +138,7 @@ All relative paths resolve against the install root (the directory containing
   any other finding; the other services, the state save and the alert flush
   all still run. Any `defaults` key left out of the config falls back to the
   documented default above (service value → `defaults` block → engine default).
-- **Escalated re-nags renew the approval.** Every "STILL DOWN … reply 'heal
+- **Escalated re-nags renew the approval.** Every "is still down … Reply 'heal
   <key>'" re-page re-creates the pending approval for the code's auto fix, so
   `heal <key>` keeps working for as long as the admin keeps being paged, not
   just for `pending_ttl_hours` after the cap was hit. A watch-only re-page

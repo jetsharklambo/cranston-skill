@@ -308,19 +308,19 @@ def main():
                     if f.get("key") == key:
                         still = True
             if chk.returncode == 0:
-                verdict = "verified HEALTHY ✅"
+                verdict = "re-checked and it's HEALTHY again ✅"
             elif still:
-                verdict = "still UNHEALTHY after remediation ⚠️ — may need manual attention"
+                verdict = "ran, but the re-check says it's still UNHEALTHY ⚠️ — needs human eyes"
             elif findings_seen:
-                verdict = "verified HEALTHY ✅"   # check failing on OTHER keys only
+                verdict = "re-checked and it's HEALTHY again ✅"   # check failing on OTHER keys only
             else:
-                verdict = ("remediation ran but the verify output was unreadable — "
+                verdict = ("the fix ran but the verify output was unreadable — "
                            "treat as unverified and watch the next monitor cycle")
         except subprocess.TimeoutExpired:
-            verdict = ("remediation ran but the verify check timed out — "
+            verdict = ("the fix ran but the verify check timed out — "
                        "treat as unverified and watch the next monitor cycle")
         except Exception as e:
-            verdict = (f"remediation ran but the verify step errored ({type(e).__name__}) — "
+            verdict = (f"the fix ran but the verify step errored ({type(e).__name__}) — "
                        f"treat as unverified and watch the next monitor cycle")
 
     # The remediation ran: the outcome is ALWAYS audited and the pending
@@ -350,7 +350,7 @@ def main():
                 rec.pop("first_failed_at", None)  # the incident is over
             save(state_file, state)
 
-    print(f"🔧 Approved heal for {key}: {Path(script).name} completed, {verdict}")
+    print(f"🔧 Done — ran {Path(script).name} for {key}: {verdict}")
     return 0
 
 

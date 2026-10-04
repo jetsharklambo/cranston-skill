@@ -600,7 +600,7 @@ class SelfHeal:
                     n = flap.get("count", 0)
                     suffix = f" (flapped {n}x before settling)" if n else ""
                     self.alert(rec,
-                               f"✅ {key} recovered ({flap['ctx']}).{flap.get('extra', '')}{suffix}",
+                               f"✅ All clear — {key} recovered (was {flap['ctx']}).{flap.get('extra', '')}{suffix}",
                                route=rec.get("notify_class", "immediate"), system=key)
                     rec.pop("flap", None)
             if rec["status"] != "ok" and rec["consecutive_failures"] >= threshold:
@@ -610,7 +610,7 @@ class SelfHeal:
                 self.pending.pop(key, None)
                 if rec.get("notify_class") == "digest":
                     # digest-class recoveries are already batched - no hold-off
-                    self.alert(rec, f"✅ {key} recovered ({ctx}).{extra}",
+                    self.alert(rec, f"✅ All clear — {key} recovered (was {ctx}).{extra}",
                                route="digest", system=key)
                 else:
                     prev = rec.get("flap") or {}
@@ -662,8 +662,16 @@ class SelfHeal:
         # provably fine and only our view of it is broken. Headlining that as
         # "DOWN" turns a router setting into a phantom outage.
         degraded = finding.get("severity") == "degraded"
-        icon = "⚠️" if degraded else "\U0001f6a8"
-        word = "DEGRADED" if degraded else "DOWN"
+        # Tone follows priority: a real outage speaks plainly and urgently; a
+        # degraded view opens softly. Codes/layers ride in a parenthetical so
+        # lines stay greppable without reading like a stack trace.
+        if layer == "selfheal":
+            lead = f"\U0001f6a8 {key}: I couldn't run its health check — {detail}"
+        elif degraded:
+            lead = f"⚠️ Heads-up: {key} looks degraded — {detail}"
+        else:
+            lead = f"\U0001f6a8 {key} is down — {detail}"
+        tail = f" ({code}, {layer} layer)" if layer != "selfheal" else f" ({code})"
 
         if rec["status"] == "escalated":
             if self.realert_due(rec, svc, code):
@@ -676,8 +684,9 @@ class SelfHeal:
                                      consent=(auto_dict or {}).get("consent"),
                                      announce=(auto_dict or {}).get("announce"))
                 route = self.demote_ask(rec, svc, code, "immediate")
-                self.alert(rec, f"\U0001f6a8 {key} STILL DOWN ({code}) — auto-restart cap "
-                                f"reached earlier. Reply 'heal {key}' to run the fix."
+                self.alert(rec, f"\U0001f6a8 {key} is still down ({code}) — I've already "
+                                f"used my restart budget, so the fix is waiting on you. "
+                                f"Reply 'heal {key}' and I'll run it."
                                 f"{self.flap_suffix(rec)}", route=route, system=key)
             return
 
@@ -712,18 +721,18 @@ class SelfHeal:
                     scope = ""
                     if consent and consent != "admin":
                         who = consent.split(":", 1)[-1] if consent.startswith("named:") else "the household"
-                        scope = f" This affects {who} — give them a heads-up."
-                    proposal = (f"Proposed fix: {Path(ask_script).name} (ask-first){pinned_note}. "
-                                f"Reply 'heal {key}' to approve.{scope}")
+                        scope = f" This affects {who} — they'll get a heads-up when it runs."
+                    proposal = (f"I can run {Path(ask_script).name}, but not without "
+                                f"your OK{pinned_note}. Reply 'heal {key}' to approve.{scope}")
                     self.add_pending(key, code, ask_script, arg, consent,
                                      announce=remediation.get("announce"))
                 else:
-                    proposal = "No safe automatic fix known — manual intervention needed."
+                    proposal = "There's no fix I can safely run myself — this one needs you."
                 route = self.notify_class(svc, code, degraded, bool(ask_script))
                 if ask_script:
                     route = self.demote_ask(rec, svc, code, route)
                 rec["notify_class"] = route
-                self.alert(rec, f"{icon} {key} {word} — layer: {layer}. {detail}. {proposal}"
+                self.alert(rec, f"{lead}{tail}. {proposal}"
                                 f"{self.flap_suffix(rec)}", route=route, system=key)
                 rec["status"] = "awaiting_approval"
                 rec["last_transition"] = iso(now())
@@ -743,12 +752,13 @@ class SelfHeal:
                              announce=(remediation or {}).get("announce"))
             # realert-gated: during a flap storm a key can re-escalate every
             # few minutes (attempt history survives recoveries by design); the
-            # escalated branch re-nags STILL DOWN on the same schedule anyway.
+            # escalated branch re-nags "is still down" on the same schedule anyway.
             if self.realert_due(rec, svc, code):
                 route = self.demote_ask(rec, svc, code, "immediate")
-                self.alert(rec, f"\U0001f6a8 {key}: {detail}. Auto-restart cap reached "
-                                f"({max_attempts} per {self.opt(svc, 'attempt_window_hours')}h). "
-                                f"Reply 'heal {key}' to run {Path(script).name}."
+                self.alert(rec, f"\U0001f6a8 {key} keeps failing — {detail}. I've hit my "
+                                f"restart limit ({max_attempts} per "
+                                f"{self.opt(svc, 'attempt_window_hours')}h) and I'm standing "
+                                f"down. Reply 'heal {key}' to run {Path(script).name} anyway."
                                 f"{self.flap_suffix(rec)}", route=route, system=key)
             return
 
@@ -780,18 +790,20 @@ class SelfHeal:
             # still pages.
             routine = (svc.get("notify_by_code", {}).get(code) == "digest"
                        or rec.get("flap", {}).get("count", 0) > 0)
-            self.alert(rec, f"\U0001f527 {key}: {code} at {layer} — auto-remediated "
-                            f"(attempt {attempt_n}/{max_attempts}). Verified healthy."
+            self.alert(rec, f"\U0001f527 {key} is back — I ran {Path(script).name} and "
+                            f"re-checked: healthy again (was {code}; attempt "
+                            f"{attempt_n}/{max_attempts})."
                             f"{self.flap_suffix(rec)}",
                        route="digest" if routine else "immediate", system=key)
             rec["status"] = "ok"
             rec["consecutive_failures"] = 0
             rec.pop("first_failed_at", None)  # the incident is over
         else:
-            why = f"exit {rc}" if rc != 0 else "verification still failing"
+            why = f"exit {rc}" if rc != 0 else "the re-check still fails"
             rec["notify_class"] = "immediate"
-            self.alert(rec, f"\U0001f6a8 {key}: {code}. Remediation {Path(script).name} ran "
-                            f"({why}). {output[-150:] if rc != 0 else detail}"
+            self.alert(rec, f"\U0001f6a8 {key} is still broken — I tried "
+                            f"{Path(script).name} but it didn't take ({why}). "
+                            f"{output[-150:] if rc != 0 else detail} ({code})"
                             f"{self.flap_suffix(rec)}")
             rec["status"] = "failing"
         rec["last_transition"] = iso(now())

@@ -51,7 +51,7 @@ with open(path + ".lock", "w") as lk:
         raise SystemExit
     if not by_system:
         raise SystemExit
-    out = ["⚠️ Daily issues digest (summary didn't run - fallback sender):", ""]
+    out = ["⚠️ Daily catch-up — the minor stuff I didn't page you about:", ""]
     for system, events in by_system.items():
         out.append(f"{system}:")
         for e in events:

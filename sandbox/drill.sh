@@ -38,7 +38,7 @@ svcctl stop media-server
 cycle
 ok "first bad cycle is absorbed (anti-flap)" 'silent'
 cycle
-ok "🔧 auto-remediated page"           'paged "🔧 media-server: SERVICE_DOWN"'
+ok "🔧 auto-remediated page"           'paged "🔧 media-server is back"'
 ok "service is running again"          'svcctl status media-server >/dev/null'
 ok "audit log has EXEC + RESULT ok"    'grep -q "EXEC service=media-server" "$ST/audit.log" && grep -q "RESULT service=media-server status=ok" "$ST/audit.log"'
 
@@ -46,13 +46,13 @@ scene "3. ASK-FIRST class: nas port closes -> page, wait for 'heal nas'"
 svcctl stop nas
 cycle; cycle
 ok "🚨 page proposes the fix"           "paged \"Reply 'heal nas' to approve\""
-ok "consent heads-up included"         'paged "give them a heads-up"'
+ok "consent heads-up included"         'paged "heads-up when it runs"'
 ok "pending approval recorded"         '[ "$(pending nas)" = True ]'
 cycle
 ok "engine did NOT fix it on its own"  '! svcctl status nas >/dev/null'
 echo "  -> admin replies 'heal nas'; agent runs approve-heal.py"
 python3 "$DEPLOY/engine/approve-heal.py" nas | tee "$ST/approve.out" | sed 's/^/    approve| /'
-ok "approve-heal reports verified fix" 'grep -q "Approved heal for nas" "$ST/approve.out"'
+ok "approve-heal reports verified fix" 'grep -q "ran sandbox-restart.sh for nas" "$ST/approve.out"'
 ok "nas running"                       'svcctl status nas >/dev/null'
 ok "pending cleared"                   '[ "$(pending nas)" = False ]'
 
@@ -70,8 +70,8 @@ scene "5. WATCH-ONLY: media-server's host unplugged -> page, no fix proposed"
 svcctl unplug 192.168.1.58
 svcctl stop media-server
 cycle; cycle
-ok "🚨 HOST_DOWN page"                  'paged "🚨 media-server DOWN — layer: host"'
-ok "says no safe automatic fix"        'paged "No safe automatic fix known"'
+ok "🚨 HOST_DOWN page"                  'paged "(HOST_DOWN, host layer)"'
+ok "says no safe automatic fix"        'paged "no fix I can safely run"'
 ok "engine did not touch it"           '! svcctl status media-server >/dev/null'
 fresh
 svcctl plug 192.168.1.58; svcctl start media-server
@@ -80,7 +80,7 @@ ok "recovery ✅ is HELD (not paged yet)" 'silent'
 if [ "$FULL" = 1 ]; then
     echo "  waiting 62s for the 1-minute recovery hold..."; sleep 62
     cycle
-    ok "held ✅ released"               'paged "✅ media-server recovered (HOST_DOWN)"'
+    ok "held ✅ released"               'paged "media-server recovered (was HOST_DOWN)"'
 else
     echo "  (skip: run with --full to wait out the hold and see the ✅)"
 fi

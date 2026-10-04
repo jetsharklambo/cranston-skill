@@ -130,7 +130,7 @@ hs.step(SVC_DEGRADED, "svcB", f)
 hs.step(SVC_DEGRADED, "svcB", f)
 ok(hs.alerts == [], "no immediate page")
 d = read_digest()
-ok(len(d) == 1 and "DEGRADED" in d[0]["message"] and d[0]["system"] == "svcB", "one digest line")
+ok(len(d) == 1 and "Heads-up" in d[0]["message"] and d[0]["system"] == "svcB", "one digest line")
 clock.advance(2)
 hs.step(SVC_DEGRADED, "svcB", f)
 ok(len(read_digest()) == 1, "second cycle throttled by realert (1440)")
@@ -168,7 +168,7 @@ hs = fresh()
 fp = {"status": "CODE_PLAIN", "layer": "l", "detail": "down"}
 hs.step(SVC_IMMEDIATE, "svcA", fp)
 hs.step(SVC_IMMEDIATE, "svcA", fp)
-ok(len(hs.alerts) == 1 and "DOWN" in hs.alerts[0], "paged DOWN")
+ok(len(hs.alerts) == 1 and "is down" in hs.alerts[0], "paged DOWN")
 hs.step(SVC_IMMEDIATE, "svcA", None)
 ok(len(hs.alerts) == 1, "✅ held back at recovery")
 clock.advance(5)
@@ -212,7 +212,7 @@ hs.step(SVC_AUTO, "svcD", fd)
 hs.step(SVC_AUTO, "svcD", fd)
 ok(hs.alerts == [], "routine 🔧 did not page")
 d = read_digest()
-ok(len(d) == 1 and "auto-remediated" in d[0]["message"], "routine 🔧 went to digest")
+ok(len(d) == 1 and "healthy again" in d[0]["message"], "routine 🔧 went to digest")
 
 print("== 7. auto success without notify_by_code still pages ==")
 hs = fresh()
@@ -221,7 +221,7 @@ hs.run_check = lambda svc: {}
 fe = {"status": "CODE_AUTO2", "layer": "l", "detail": "down"}
 hs.step(SVC_AUTO_PAGE, "svcE", fe)
 hs.step(SVC_AUTO_PAGE, "svcE", fe)
-ok(len(hs.alerts) == 1 and "auto-remediated" in hs.alerts[0], "non-routine 🔧 pages")
+ok(len(hs.alerts) == 1 and "healthy again" in hs.alerts[0], "non-routine 🔧 pages")
 
 print("== 8. remediation failure always pages ==")
 hs = fresh()
@@ -229,7 +229,7 @@ hs.run_remediation = lambda svc, script, arg: (1, "boom")
 hs.run_check = lambda svc: {"svcE": fe}
 hs.step(SVC_AUTO_PAGE, "svcE", fe)
 hs.step(SVC_AUTO_PAGE, "svcE", fe)
-ok(len(hs.alerts) == 1 and "Remediation" in hs.alerts[0], "failed remediation pages")
+ok(len(hs.alerts) == 1 and "didn't take" in hs.alerts[0], "failed remediation pages")
 
 print("== 9. cap alert is realert-gated ==")
 hs = fresh()
@@ -244,7 +244,7 @@ hs.step(SVC_AUTO_PAGE, "svcE", fe)
 ok(hs.alerts == [] and rec["status"] == "escalated", "cap reached silently inside realert window")
 clock.advance(61)
 hs.step(SVC_AUTO_PAGE, "svcE", fe)
-ok(len(hs.alerts) == 1 and "STILL DOWN" in hs.alerts[0], "escalated re-nag after window")
+ok(len(hs.alerts) == 1 and "is still down" in hs.alerts[0], "escalated re-nag after window")
 
 print("== 10. backward compat: legacy record without new fields recovers ==")
 hs = fresh()
@@ -428,7 +428,7 @@ future = "2099-01-01T00:00:00Z"
 env = dict(__import__("os").environ, SELFHEAL_CONFIG=str(ah / "services.json"))
 r = subprocess.run([sys.executable, str(ah / "engine" / "approve-heal.py"), "svcX", "654321"],
                    capture_output=True, text=True, env=env)
-ok(r.returncode == 0 and "completed" in r.stdout, "valid code: gate approved, heal completed")
+ok(r.returncode == 0 and "Done — ran" in r.stdout, "valid code: gate approved, heal completed")
 ok(gate_out.exists() and "code=654321" in gate_out.read_text()
    and "caller=approve-heal" in gate_out.read_text(),
    "gate saw GATE_CODE and the approve-heal caller")
@@ -462,7 +462,7 @@ cfg["services"] = [{"name": "svcX", "check": str(chk_ok), "params": {"P": "1"}, 
 r = subprocess.run([sys.executable, str(ah / "engine" / "approve-heal.py"), "svcX", "654321"],
                    capture_output=True, text=True, env=env)
 got = env_out.read_text().split("|") if env_out.exists() else ["", "", ""]
-ok(r.returncode == 0 and "verified HEALTHY" in r.stdout,
+ok(r.returncode == 0 and "HEALTHY again" in r.stdout,
    "heal completed and the verify check ran (no crash on the verify path)")
 ok(Path(got[0]).resolve() == (ah / "state" / "audit.log").resolve(),
    "SELFHEAL_AUDIT_LOG is the deployment's audit log")
@@ -520,7 +520,7 @@ ok("totp=UNSET" in seen and pending_kept(), "inherited GATE_TOTP_URL stripped; p
 reset_pending()
 r = approve("svcX", "654321")
 seen = gate_out.read_text() if gate_out.exists() else ""
-ok(r.returncode == 0 and "completed" in r.stdout, "with a code the gate approves and the heal completes")
+ok(r.returncode == 0 and "Done — ran" in r.stdout, "with a code the gate approves and the heal completes")
 ok("code=654321" in seen and "caller=approve-heal" in seen and "auto=UNSET" in seen
    and "totp=UNSET" in seen, "gate saw GATE_CODE and the caller, nothing inherited")
 n_exec = approved_execs()                  # baseline: refusals below must not add to it
@@ -669,7 +669,8 @@ ok(saved["_errors"]["svc2"]["error"] == err["error"] and saved["keys"]["svc3"]["
 ok(hs.state["keys"]["svc2"]["last_status_code"] == "CHECK_ERROR" and hs.alerts == [],
    "the failing service's root key stepped with a synthesized CHECK_ERROR (absorbing, 1/2)")
 hs.run()                                        # second failing cycle: threshold reached
-ok(any("svc2 DOWN" in a and "layer: selfheal" in a and "engine error while processing this service" in a
+ok(any("svc2: I couldn't run its health check" in a and "(CHECK_ERROR)" in a
+       and "engine error while processing this service" in a
        and "RuntimeError: boom in the middle" in a for a in hs.alerts),
    "after fail_threshold cycles the failing service pages the engine error (CHECK_ERROR at layer selfheal)")
 ok(len(hs.alerts) == 3, "svc1 and svc3 paged their own DOWN in the same cycle")
@@ -697,7 +698,7 @@ hs = fresh(cfgmin)
 hs.state = {"keys": {}}
 hs.run_check = lambda svc: {"svc1": dict(down)}
 hs.run(); hs.run()
-ok(any("svc1 DOWN" in a for a in hs.alerts) and "_errors" not in hs.state,
+ok(any("svc1 is down" in a for a in hs.alerts) and "_errors" not in hs.state,
    "a config whose defaults is {} runs and pages without KeyError (ENGINE_DEFAULTS)")
 ok(hs.opt(svc_1, "check_timeout_seconds") == 45 and hs.pending_ttl_hours == 6 and hs.grace_minutes == 6,
    "the documented defaults fill the gaps")
@@ -730,7 +731,7 @@ clock.advance(6 * 60 + 61)                      # past pending_ttl_hours AND the
 ok(sh.parse_iso(exp_cap) < clock.t, "(the cap's approval has lapsed by now)")
 n = len(hs.alerts)
 hs.run()                                        # still failing -> STILL DOWN re-nag
-ok(len(hs.alerts) == n + 1 and "STILL DOWN" in hs.alerts[-1] and "heal svcE/ctr-1" in hs.alerts[-1],
+ok(len(hs.alerts) == n + 1 and "is still down" in hs.alerts[-1] and "heal svcE/ctr-1" in hs.alerts[-1],
    "the escalated re-nag fired")
 pend = hs.pending.get("svcE/ctr-1")
 ok(pend is not None and sh.parse_iso(pend["expires"]) > clock.t,
@@ -740,7 +741,7 @@ ok(pend["script"] == "/x/auto.sh" and pend["status_code"] == "CODE_AUTO2" and pe
 ok(json.loads((tmp / "state" / "pending-approvals.json").read_text())["svcE/ctr-1"]["expires"] == pend["expires"],
    "the renewed entry survived expire_pending and reached disk")
 clock.advance(6 * 60 + 61); hs.run()            # and again on the next re-page
-ok("STILL DOWN" in hs.alerts[-1] and sh.parse_iso(hs.pending["svcE/ctr-1"]["expires"]) > clock.t,
+ok("is still down" in hs.alerts[-1] and sh.parse_iso(hs.pending["svcE/ctr-1"]["expires"]) > clock.t,
    "renewed on every re-page, for as long as the admin keeps being paged")
 # the awaiting_approval re-page already renews an ask-first entry (group 3);
 # a watch-only (null) remediation must never create one
@@ -774,19 +775,19 @@ ok(rec["last_alert"] is None, "last_alert restored to its previous value (None) 
 ok(hs.state["_sink"]["consecutive_failures"] == 1 and "502" in hs.state["_sink"]["detail"]
    and hs.state["_sink"]["last_failure"] == sh.iso(clock.t), "_sink records the failure and the sink's output")
 got = sink29.read_text()
-ok("svcA DOWN" in got and f"state_dir={hs.state_dir}" in got, "the sink saw the page and SELFHEAL_STATE_DIR")
+ok("svcA is down" in got and f"state_dir={hs.state_dir}" in got, "the sink saw the page and SELFHEAL_STATE_DIR")
 saved = json.loads((tmp / "state" / "state.json").read_text())
 ok(saved["keys"]["svcA"]["last_alert"] is None and saved["_sink"]["consecutive_failures"] == 1,
    "the restored stamp is what reached disk (flush runs before the save)")
 ok(hs.alerts == [] and read_digest() == [], "queue drained, nothing written to the digest (no duplicate later)")
 sink29.unlink()
 hs.run()                                        # next cycle: realert_due -> re-sent
-ok(sink29.exists() and "svcA DOWN" in sink29.read_text(), "the lost page was re-sent next cycle")
+ok(sink29.exists() and "svcA is down" in sink29.read_text(), "the lost page was re-sent next cycle")
 ok(hs.state["_sink"]["consecutive_failures"] == 2 and rec["last_alert"] is None, "still failing: count climbs")
 hs.alert_sink = ["bash", sink_ok]
 sink29.unlink()
 hs.run()                                        # the sink works again
-ok(sink29.exists() and "svcA DOWN" in sink29.read_text(), "re-sent again and delivered this time")
+ok(sink29.exists() and "svcA is down" in sink29.read_text(), "re-sent again and delivered this time")
 ok(hs.state["_sink"]["consecutive_failures"] == 0 and hs.state["_sink"]["last_success"] == sh.iso(clock.t)
    and "detail" not in hs.state["_sink"], "_sink reports the recovery")
 ok(rec["last_alert"] == sh.iso(clock.t), "last_alert stays stamped once delivered")
@@ -841,7 +842,7 @@ print("== 30. approve-heal accepts engine-shaped keys, rejects multi-slash ==")
 ah, fix = ah_setup()
 ah_pending(ah, "svcY/me@host:1", fix)
 r = ah_run(ah, "svcY/me@host:1")
-ok(r.returncode == 0 and "completed" in r.stdout,
+ok(r.returncode == 0 and "Done — ran" in r.stdout,
    "a subkey with '@' and ':' is approvable (matches valid_finding/ARG_RE)")
 r = ah_run(ah, "a/b/c")
 ok(r.returncode == 64 and "Usage" in r.stdout, "a multi-slash key is rejected at the door")
@@ -925,13 +926,13 @@ ah, fix = ah_setup()
 ah_pending(ah, "svcX", fix)
 (ah / "state" / "state.json").write_text("{garbage")
 r = ah_run(ah, "svcX")
-ok(r.returncode == 0 and "completed" in r.stdout, "corrupt state.json: the heal still completes")
+ok(r.returncode == 0 and "Done — ran" in r.stdout, "corrupt state.json: the heal still completes")
 ok(list((ah / "state").glob("state.json.corrupt-*")),
    "the corrupt file was moved aside, not silently treated as empty")
 ah_pending(ah, "svcX", fix)
 (ah / "state" / "state.json").write_text("{}")
 r = ah_run(ah, "svcX")
-ok(r.returncode == 0 and "completed" in r.stdout, "state.json without a 'keys' table: no KeyError")
+ok(r.returncode == 0 and "Done — ran" in r.stdout, "state.json without a 'keys' table: no KeyError")
 # a config with NO defaults block: VERIFY_DEFAULTS fills the verify tunables
 chk_ok33 = ah / "chk-ok.sh"
 chk_ok33.write_text("#!/bin/bash\nexit 0\n")
@@ -941,7 +942,7 @@ chk_ok33.write_text("#!/bin/bash\nexit 0\n")
                    "verify_delay_seconds": 0, "remediations": {}}]}))
 ah_pending(ah, "svcX", fix)
 r = ah_run(ah, "svcX")
-ok(r.returncode == 0 and "verified HEALTHY" in r.stdout,
+ok(r.returncode == 0 and "HEALTHY again" in r.stdout,
    "a config without defaults verifies fine (VERIFY_DEFAULTS)")
 shutil.rmtree(ah)
 

@@ -110,8 +110,8 @@ scene "5. the filled config drives the engine the way the answers said"
 clean; svcctl start nas; svcctl start media-server; cycle >/dev/null
 svcctl stop nas; svcctl stop media-server
 cycle; cycle
-ok "media-server (fix) was auto-remediated"      'paged "🔧 media-server: SERVICE_DOWN" && svcctl status media-server >/dev/null'
-ok "nas (ask) paged with the heads-up and waited" "paged \"Reply 'heal nas'\" && paged \"give them a heads-up\" && ! svcctl status nas >/dev/null"
+ok "media-server (fix) was auto-remediated"      'paged "🔧 media-server is back" && svcctl status media-server >/dev/null'
+ok "nas (ask) paged with the heads-up and waited" "paged \"Reply 'heal nas'\" && paged \"heads-up when it runs\" && ! svcctl status nas >/dev/null"
 python3 "$DEPLOY/engine/approve-heal.py" nas | sed 's/^/    approve| /'
 ok "approve-heal fixed nas"                      'svcctl status nas >/dev/null'
 
@@ -125,7 +125,7 @@ I fill --apply | tee "$ST/fill.out"
 ok "the earlier ask entry was replaced (~)"      'grep -q "~ remediations.PORT_CLOSED" "$ST/fill.out"'
 ok "nas PORT_CLOSED is now null"                 '[ "$(field nas remediations.PORT_CLOSED)" = null ]'
 clean; cycle >/dev/null; svcctl stop nas; cycle; cycle
-ok "the engine now only tells"                   'paged "No safe automatic fix known"'
+ok "the engine now only tells"                   'paged "no fix I can safely run"'
 svcctl start nas
 
 scene "7. manual config wins: a hand edit survives --overwrite"
