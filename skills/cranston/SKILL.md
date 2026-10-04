@@ -50,6 +50,7 @@ is not, and batches the rest into one daily digest.
 | Worked 12-service example (+ its notes) | `${HERMES_SKILL_DIR}/references/example-cranston/` |
 | Check templates (9) | `${HERMES_SKILL_DIR}/scripts/checks/templates/` |
 | Remediation templates | `${HERMES_SKILL_DIR}/scripts/remediations/templates/` |
+| Approval-gate templates + interview | `${HERMES_SKILL_DIR}/scripts/gates/`, `${HERMES_SKILL_DIR}/references/approval-gates.md` |
 | Hardware guidance | `${HERMES_SKILL_DIR}/references/hardware.md` |
 | Onboarding methodology (placeholder) | `${HERMES_SKILL_DIR}/references/methodology.md` |
 | Live state (per deployment) | `<deploy-root>/state/state.json`, `pending-approvals.json`, `audit.log` |
@@ -68,8 +69,9 @@ is not, and batches the rest into one daily digest.
   straight at a sender (Telegram example in the Procedure).
 - **Optional approval gate** (`paths.approval_gate`): an argv prefix the
   engine prepends when executing remediations (the deployment's 2FA/audit
-  path). Until one is configured, keep nothing in `remediations` you wouldn't
-  run on a plain shell.
+  path). Choose it with the gate interview (see Procedure); working templates
+  ship in `${HERMES_SKILL_DIR}/scripts/gates/`. Until one is configured, keep
+  nothing in `remediations` you wouldn't run on a plain shell.
 
 ## Procedure
 
@@ -119,6 +121,21 @@ is not, and batches the rest into one daily digest.
    */2 * * * * flock -n /tmp/cranston.cronlock python3 /opt/cranston/engine/selfheal.py >> /var/log/cranston.log 2>&1
    25 5 * * *  SELFHEAL_DIGEST_FILE=/opt/cranston/state/digest.jsonl SELFHEAL_NOTIFY_CMD=/opt/cranston/bin/my-sink.sh /opt/cranston/bin/flush-digest.sh
    ```
+
+### Choose the approval gate (interview)
+
+Run the Discover → Decide → Recommend flow in
+`${HERMES_SKILL_DIR}/references/approval-gates.md`: probe for an existing gated
+command path, a configured chat bot, and a second always-on device; read
+which risk class `remediations` actually contains; then recommend ONE of —
+reuse the deployment's existing gate, `gates/gate-totp-remote.sh` + the
+single-file verifier on the second device, `gates/gate-telegram-confirm.sh`,
+plain SSH-as-the-gate for fail-safe-only setups, or demoting risky
+remediations to watch-only when no second factor exists. Say the honest
+caveat lines verbatim (they are written in the reference), wire the choice
+into `paths.approval_gate`, and **drill the refusal path once** before
+trusting the approval path. Never place a TOTP secret on this box — that is
+the anti-pattern the reference names.
 
 ### Operate
 

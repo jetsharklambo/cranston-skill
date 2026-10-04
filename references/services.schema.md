@@ -16,7 +16,8 @@ All relative paths resolve against the install root (the directory containing
     "digest_file": "state/digest.jsonl",// daily-digest sink; lock is <file>.lock (fcntl)
     "alert_sink":  "bin/send-alert.sh", // string (one file; .sh/.py get an interpreter)
                                         // or argv list. Called with alert lines as args.
-    "approval_gate": null           // argv PREFIX for running remediations, e.g.
+    "approval_gate": null           // argv PREFIX for running remediations (contract,
+                                    // interview + templates: approval-gates.md), e.g.
                                     // ["bash", "/path/adapter-gate.sh"]. The engine runs
                                     // gate + [script] (+ [arg]) — argv only, never a shell
                                     // string. null/[] = run directly with bash.

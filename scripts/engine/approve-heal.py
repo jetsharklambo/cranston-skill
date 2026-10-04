@@ -1,10 +1,14 @@
 #!/usr/bin/env python3
-"""approve-heal.py <service-key> - execute a human-approved remediation.
+"""approve-heal.py <service-key> [code] - execute a human-approved remediation.
 
 The host-framework adapter invokes this after the user approves a pending fix
-(e.g. replies 'heal <key>' in the chat channel). The adapter's dangerous-
-command gate must classify this script as gated, so the path stays behind the
-deployment's 2FA.
+(e.g. replies 'heal <key>' in the chat channel). The remediation runs through
+the deployment's `paths.approval_gate` (argv prefix) when one is configured -
+the gate sees SELFHEAL_CALLER=approve-heal and NO SELFHEAL_AUTOMATION marker,
+which is its cue to demand the second factor (contract + templates:
+references/approval-gates.md). The optional [code] argument (e.g. a TOTP code
+the user included in the chat reply) is passed to the gate as the GATE_CODE
+env var; it is never written to the audit log or state.
 
 Looks up the pending-approval entry recorded by selfheal.py, runs the recorded
 remediation, re-runs the service's health check to verify (catching the verify
@@ -62,11 +66,31 @@ def svc_env(svc):
     return env
 
 
+def argvify(v):
+    """Same semantics as selfheal.py's argvify: a string names one file
+    (.sh/.py get an interpreter), a list is taken as-is with '/'-containing
+    elements resolved against the install root."""
+    if not v:
+        return []
+    if isinstance(v, str):
+        path = str(resolve(v))
+        if path.endswith(".sh"):
+            return ["bash", path]
+        if path.endswith(".py"):
+            return ["python3", path]
+        return [path]
+    return [str(resolve(x)) if "/" in str(x) else str(x) for x in v]
+
+
 def main():
-    if len(sys.argv) != 2 or not re.fullmatch(r"[A-Za-z0-9/_.-]+", sys.argv[1]):
-        print("Usage: approve-heal.py <service-key>")
+    if len(sys.argv) not in (2, 3) or not re.fullmatch(r"[A-Za-z0-9/_.-]+", sys.argv[1]):
+        print("Usage: approve-heal.py <service-key> [code]")
         return 64
     key = sys.argv[1]
+    gate_code = sys.argv[2] if len(sys.argv) == 3 else None
+    if gate_code is not None and not re.fullmatch(r"[A-Za-z0-9-]{4,64}", gate_code):
+        print("Usage: approve-heal.py <service-key> [code]   (code: 4-64 alphanumerics)")
+        return 64
 
     config_path = os.environ.get("SELFHEAL_CONFIG", str(ROOT / "services.json"))
     config = load(Path(config_path), {"services": [], "paths": {}, "defaults": {}})
@@ -113,12 +137,28 @@ def main():
             f.write(f"{now_iso()} ts={int(time.time())} APPROVED-EXEC service={key} "
                     f"script={script} arg={arg or ''} caller=approve-heal\n")
 
-        cmd = ["bash", str(resolve(script))] + ([arg] if arg else [])
+        # Human-approved runs go through the deployment's approval gate when
+        # one is configured. The gate distinguishes this caller from the
+        # engine's auto path by SELFHEAL_CALLER=approve-heal and the ABSENCE
+        # of SELFHEAL_AUTOMATION, and may demand a second factor; GATE_CODE
+        # carries one supplied with the approval. Budget is 300s here (vs the
+        # engine's 180s) so an interactive gate has room for the human.
+        gate = argvify(config.get("paths", {}).get("approval_gate"))
+        cmd = (gate or ["bash"]) + [str(resolve(script))] + ([arg] if arg else [])
+        env = svc_env(svc)
+        if gate_code:
+            env["GATE_CODE"] = gate_code
         try:
-            r = subprocess.run(cmd, capture_output=True, text=True, timeout=180,
-                               env=svc_env(svc))
+            r = subprocess.run(cmd, capture_output=True, text=True, timeout=300,
+                               env=env)
         except subprocess.TimeoutExpired:
-            print(f"❌ {Path(script).name} timed out after 180s. State unchanged.")
+            print(f"❌ {Path(script).name} timed out after 300s "
+                  f"(gate included). State unchanged.")
+            return 1
+        if r.returncode == 65:
+            out = (r.stdout + r.stderr).strip()
+            print(f"⛔ approval gate refused: {out[-300:] or 'no reason given'}. "
+                  f"The pending approval is kept - retry with a valid factor.")
             return 1
         out = (r.stdout + r.stderr).strip()
         if r.returncode == 75:

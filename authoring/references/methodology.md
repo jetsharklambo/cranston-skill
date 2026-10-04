@@ -9,3 +9,7 @@ document; sections 3, 4 and 7).
 Phase 4 splits it into skill-consumable reference files here, so an agent
 can run the onboarding conversationally and generate `services.json` +
 `doctrine.md` for the admin to review.
+
+**First shipped Decide module:** approval-gate selection lives in
+[approval-gates.md](approval-gates.md) — discovery probes, a decision table,
+and the literal recommendation blurbs, runnable by an agent during onboarding.

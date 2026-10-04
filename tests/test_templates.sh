@@ -159,6 +159,79 @@ assert "resolver+upstreams all dead -> UPSTREAM_DOWN" 1 '"status": "UPSTREAM_DOW
     CHECK_KEY=dns RESOLVER_IP=127.0.0.1 UPSTREAM1=127.0.0.1 UPSTREAM2=127.0.0.1 \
     TEST_DOMAIN=example.invalid bash "$CK/check-dns.sh"
 
+echo "== approval gates: TEMPLATE + auto-pass contract =="
+GT="$SRCROOT/gates"
+# a fake "remediations dir" layout so the auto-pass path check works
+FAKEROOT="$T/fakeroot"; mkdir -p "$FAKEROOT/remediations"
+MARK="$T/gate-exec-marker"
+printf '#!/bin/bash\necho ran > "%s"\n' "$MARK" > "$FAKEROOT/remediations/fix.sh"
+assert "template refuses with no factor (65)" 65 "no factor configured" -- \
+    SELFHEAL_ROOT="$FAKEROOT" bash "$GT/TEMPLATE.sh" "$FAKEROOT/remediations/fix.sh"
+assert "template refuses a missing script (65)" 65 "no such remediation" -- \
+    bash "$GT/TEMPLATE.sh" "$T/does-not-exist.sh"
+rm -f "$MARK"
+SELFHEAL_AUTOMATION=true SELFHEAL_ROOT="$FAKEROOT" bash "$GT/TEMPLATE.sh" "$FAKEROOT/remediations/fix.sh" >/dev/null 2>&1
+[ -f "$MARK" ] && ok "auto path passes through and runs the remediation" || bad "auto path passes through"
+rm -f "$MARK"
+SELFHEAL_AUTOMATION=true SELFHEAL_ROOT="$FAKEROOT" bash "$GT/TEMPLATE.sh" "$T/does-not-exist.sh" >/dev/null 2>&1
+[ ! -f "$MARK" ] && ok "auto path still refuses scripts outside remediations/" || bad "auto path path-anchored"
+
+echo "== approval gates: totp server + client =="
+SECF="$T/totp-secret"; printf 'GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ' > "$SECF"; chmod 600 "$SECF"
+TPORT=$(python3 -c 'import socket;s=socket.socket();s.bind(("127.0.0.1",0));print(s.getsockname()[1]);s.close()')
+GATE_TOTP_NOW=59 python3 "$GT/gate-totp-server.py" "$SECF" "$TPORT" >/dev/null 2>&1 & TOTP_PID=$!
+for _ in $(seq 30); do curl -s -m 1 "http://127.0.0.1:$TPORT/health" >/dev/null 2>&1 && break; sleep 0.2; done
+# RFC 6238 known answer at T=59 for this secret is 287082
+assert "verifier accepts the RFC 6238 code" 0 '"ok": true' -- \
+    curl -s -m 5 -X POST "http://127.0.0.1:$TPORT/verify" -H "Content-Type: application/json" -d '{"code": "287082"}'
+R=$(curl -s -m 5 -X POST "http://127.0.0.1:$TPORT/verify" -H "Content-Type: application/json" -d '{"code": "000000"}')
+echo "$R" | grep -q '"ok": false' && ok "verifier rejects a wrong code" || bad "verifier rejects a wrong code ($R)"
+for i in 1 2 3 4 5; do curl -s -m 5 -X POST "http://127.0.0.1:$TPORT/verify" -d '{"code": "111111"}' >/dev/null; done
+R=$(curl -s -m 5 -X POST "http://127.0.0.1:$TPORT/verify" -d '{"code": "287082"}')
+echo "$R" | grep -q "locked out" && ok "lockout engages after repeated failures" || bad "lockout engages ($R)"
+kill $TOTP_PID 2>/dev/null; wait $TOTP_PID 2>/dev/null
+# client gate against a fresh (unlocked) server
+GATE_TOTP_NOW=59 python3 "$GT/gate-totp-server.py" "$SECF" "$TPORT" >/dev/null 2>&1 & TOTP_PID=$!
+for _ in $(seq 30); do curl -s -m 1 "http://127.0.0.1:$TPORT/health" >/dev/null 2>&1 && break; sleep 0.2; done
+rm -f "$MARK"
+GATE_CODE=287082 GATE_TOTP_URL="http://127.0.0.1:$TPORT" SELFHEAL_ROOT="$FAKEROOT" \
+    bash "$GT/gate-totp-remote.sh" "$FAKEROOT/remediations/fix.sh" >/dev/null 2>&1
+[ -f "$MARK" ] && ok "totp client gate execs on a valid code" || bad "totp client gate execs on valid code"
+assert "totp client gate refuses a bad code (65)" 65 "failing closed" -- \
+    env GATE_CODE=999999 GATE_TOTP_URL="http://127.0.0.1:$TPORT" SELFHEAL_ROOT="$FAKEROOT" \
+    bash "$GT/gate-totp-remote.sh" "$FAKEROOT/remediations/fix.sh"
+assert "totp client gate refuses with no code and no tty (65)" 65 "no code supplied" -- \
+    env GATE_TOTP_URL="http://127.0.0.1:$TPORT" SELFHEAL_ROOT="$FAKEROOT" \
+    bash "$GT/gate-totp-remote.sh" "$FAKEROOT/remediations/fix.sh" < /dev/null
+kill $TOTP_PID 2>/dev/null; wait $TOTP_PID 2>/dev/null
+
+echo "== approval gates: telegram confirm (stub Bot API) =="
+GPORT=$(python3 -c 'import socket;s=socket.socket();s.bind(("127.0.0.1",0));print(s.getsockname()[1]);s.close()')
+TGENV="$T/tg.env"; printf 'GATE_TG_BOT_TOKEN="stub"\nGATE_TG_CHAT_ID="123456789"\n' > "$TGENV"; chmod 600 "$TGENV"
+tg_case() {  # <mode> -> runs the gate, echoes rc; marker tells if exec happened
+    local mode="$1"
+    STUB_MODE="$mode" python3 "$REPO/tests/fixtures/stub-telegram.py" "$GPORT" & local spid=$!
+    for _ in $(seq 30); do curl -s -m 1 "http://127.0.0.1:$GPORT/botstub/getUpdates" >/dev/null 2>&1 && break; sleep 0.2; done
+    rm -f "$MARK"
+    GATE_TELEGRAM_ENV="$TGENV" GATE_TG_API="http://127.0.0.1:$GPORT" GATE_TIMEOUT=6 \
+        SELFHEAL_ROOT="$FAKEROOT" bash "$GT/gate-telegram-confirm.sh" "$FAKEROOT/remediations/fix.sh" >/dev/null 2>&1
+    local rc=$?
+    kill "$spid" 2>/dev/null; wait "$spid" 2>/dev/null
+    echo "$rc"
+}
+RC=$(tg_case approve)
+[ "$RC" = 0 ] && [ -f "$MARK" ] && ok "telegram gate execs on 'approve <nonce>'" || bad "telegram gate approve (rc=$RC)"
+RC=$(tg_case deny)
+[ "$RC" = 65 ] && [ ! -f "$MARK" ] && ok "telegram gate refuses on 'deny <nonce>'" || bad "telegram gate deny (rc=$RC)"
+RC=$(tg_case wrong)
+[ "$RC" = 65 ] && [ ! -f "$MARK" ] && ok "telegram gate times out on a wrong nonce" || bad "telegram gate wrong nonce (rc=$RC)"
+RC=$(tg_case stranger)
+[ "$RC" = 65 ] && [ ! -f "$MARK" ] && ok "telegram gate ignores the right text from the wrong chat" || bad "telegram gate stranger chat (rc=$RC)"
+chmod 644 "$TGENV"
+assert "telegram gate refuses a world-readable creds file (65)" 65 "mode 600" -- \
+    env GATE_TELEGRAM_ENV="$TGENV" SELFHEAL_ROOT="$FAKEROOT" \
+    bash "$GT/gate-telegram-confirm.sh" "$FAKEROOT/remediations/fix.sh"
+
 kill $HTTP_PID 2>/dev/null; wait $HTTP_PID 2>/dev/null
 rm -rf "$T"
 

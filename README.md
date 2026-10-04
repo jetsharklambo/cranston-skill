@@ -57,7 +57,7 @@ authoring/              THE hand-edited source
 SKILL.md + scripts/ + references/ + assets/   GENERATED (OpenClaw root artifact)
 skills/cranston/                              GENERATED (Hermes tap artifact)
 tools/                  build.py + check_drift.py + validate_links.py
-tests/                  engine suite (56 assertions) + template smoke tests (36)
+tests/                  engine suite (60 assertions) + template smoke tests (51)
                         + build tooling tests (22)
 docs/                   the dual-platform repository spec + design notes
 ```
@@ -161,7 +161,7 @@ always-on work and lose *silently*, so a stock-Android phone should never be
 the only monitor (set `defaults.gateway_ip`; Android blocks the route-table
 read the network gate otherwise uses). A postmarketOS-flashed phone is the
 trustworthy version. Full story, recipes, and the battery-swelling warnings:
-**[docs/hardware.md](docs/hardware.md)**.
+**[references/hardware.md](references/hardware.md)**.
 
 **Don't run it on:** a cloud VPS, a gaming desktop (idle watts), a VM on
 your daily-use machine, or the router/NAS it's supposed to watch.
@@ -176,7 +176,7 @@ things it should watch.
 
 ### 0. Prerequisites
 
-See **Prerequisites: the always-on box** above (and `docs/hardware.md` for
+See **Prerequisites: the always-on box** above (and `references/hardware.md` for
 the full device guide). If the box runs on battery-backed power, give it a
 `check-host-power.sh` service — that template exists precisely for the
 machine doing the watching.
@@ -260,6 +260,29 @@ on your chat reply, behind the deployment's 2FA gate (`paths.approval_gate`).
 Until a gate is configured, leave nothing in `remediations` you wouldn't
 want run on a plain shell.
 
+### 5b. Approval gates — pick the one your home can actually support
+
+The gate is a pluggable argv prefix; working templates ship in
+`scripts/gates/`, and `references/approval-gates.md` is an interview the
+agent can run against your setup (Cranston walks you through this during
+onboarding). The ladder:
+
+- **Tier 0 — SSH is the gate.** Fine for a solo admin whose remediations are
+  all fail-safe-direction; adding TOTP *on the same box* would be theater,
+  because the agent could read the secret.
+- **Tier 1 — chat confirmation** (`gate-telegram-confirm.sh`): the gate
+  itself messages your pinned chat a one-time nonce and reads the reply
+  straight from the Bot API — possession of your phone, nothing new to
+  install.
+- **Tier 2 — off-box code verification** (`gate-totp-remote.sh` +
+  `gate-totp-server.py`): a single-file, dependency-free RFC-6238 verifier
+  on a *second* device (HA box, NAS, an old phone — see `references/hardware.md`),
+  so the agent's box can never mint its own approvals. No Docker.
+
+If none of those are possible and a remediation is risky, the right answer
+is not a weaker gate — it's demoting that remediation to watch-only until a
+second factor exists.
+
 ### 6. Know what you just promised your household
 
 Before wiring any remediation that cuts power or restarts something shared:
@@ -309,8 +332,8 @@ mode-600 file the cron line sources.
 ## Running the tests
 
 ```
-python3 tests/test_engine.py     # 56 assertions, isolated temp install
-bash tests/test_templates.sh     # 36 assertions, offline (local stub servers)
+python3 tests/test_engine.py     # 60 assertions, isolated temp install
+bash tests/test_templates.sh     # 51 assertions, offline (local stub servers)
 python3 tests/test_build.py      # 22 assertions, build/drift/link tooling
 ```
 

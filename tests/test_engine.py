@@ -388,5 +388,47 @@ hs.step(SVC_ASK, "svcC", fa)
 hs.step(SVC_ASK, "svcC", fa)
 ok(len(hs.alerts) == 4, "a fresh incident pages immediately again")
 
+print("== 20. approve-heal runs the gate and passes GATE_CODE ==")
+import subprocess
+ah = Path(tempfile.mkdtemp(prefix="cranston-ah-test-"))
+(ah / "engine").mkdir()
+(ah / "state").mkdir()
+(ah / "remediations").mkdir()
+shutil.copy(REPO / "authoring" / "scripts" / "engine" / "approve-heal.py",
+            ah / "engine" / "approve-heal.py")
+gate_out = ah / "gate-env.txt"
+gate = ah / "my-gate.sh"
+gate.write_text("#!/bin/bash\n"
+                f"echo \"code=$GATE_CODE caller=$SELFHEAL_CALLER auto=${{SELFHEAL_AUTOMATION:-}}\" > {gate_out}\n"
+                "if [ \"$GATE_CODE\" = \"654321\" ]; then exec bash \"$@\"; fi\n"
+                "echo \"gate: bad code\"; exit 65\n")
+fix = ah / "remediations" / "fix.sh"
+fix.write_text("#!/bin/bash\nexit 0\n")
+cfg = {"version": 2,
+       "paths": {"approval_gate": str(gate)},
+       "defaults": {"verify_delay_seconds": 0, "check_timeout_seconds": 5},
+       "services": []}
+(ah / "services.json").write_text(json.dumps(cfg))
+future = "2099-01-01T00:00:00Z"
+(ah / "state" / "pending-approvals.json").write_text(json.dumps(
+    {"svcX": {"status_code": "C", "script": str(fix), "arg": None, "expires": future}}))
+env = dict(__import__("os").environ, SELFHEAL_CONFIG=str(ah / "services.json"))
+r = subprocess.run([sys.executable, str(ah / "engine" / "approve-heal.py"), "svcX", "654321"],
+                   capture_output=True, text=True, env=env)
+ok(r.returncode == 0 and "completed" in r.stdout, "valid code: gate approved, heal completed")
+ok(gate_out.exists() and "code=654321" in gate_out.read_text()
+   and "caller=approve-heal" in gate_out.read_text(),
+   "gate saw GATE_CODE and the approve-heal caller")
+ok("auto=\n" in gate_out.read_text() or gate_out.read_text().rstrip().endswith("auto="),
+   "SELFHEAL_AUTOMATION is NOT set on the human path")
+(ah / "state" / "pending-approvals.json").write_text(json.dumps(
+    {"svcX": {"status_code": "C", "script": str(fix), "arg": None, "expires": future}}))
+r = subprocess.run([sys.executable, str(ah / "engine" / "approve-heal.py"), "svcX", "111111"],
+                   capture_output=True, text=True, env=env)
+pend = json.loads((ah / "state" / "pending-approvals.json").read_text())
+ok(r.returncode == 1 and "gate refused" in r.stdout and "svcX" in pend,
+   "bad code: gate refusal surfaces and the pending approval is KEPT")
+shutil.rmtree(ah)
+
 print(f"\nALL {PASS} ASSERTIONS PASSED")
 shutil.rmtree(tmp)
