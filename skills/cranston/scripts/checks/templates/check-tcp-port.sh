@@ -41,7 +41,12 @@ if [ "$SPLIT" = "1" ] && host_pings "$TCP_HOST"; then
     emit "$KEY" "PORT_CLOSED" "service" \
          "host ${TCP_HOST} pings but nothing is listening on tcp/${TCP_PORT} - service down or firewalled"
 else
+    # The ping claim is only true when the split actually ran: this branch is
+    # reached after a FAILED ping when SPLIT=1, but with PING_SPLIT=0 no ping
+    # was ever attempted.
+    PINGNOTE=""
+    [ "$SPLIT" = "1" ] && PINGNOTE=" and not answering ping"
     emit "$KEY" "HOST_DOWN" "host" \
-         "${TCP_HOST} unreachable on tcp/${TCP_PORT}${SPLIT:+ and not answering ping} - host likely down"
+         "${TCP_HOST} unreachable on tcp/${TCP_PORT}${PINGNOTE} - host likely down"
 fi
 exit 1

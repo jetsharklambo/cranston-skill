@@ -1,9 +1,9 @@
 #!/bin/bash
 # test_templates.sh - offline smoke tests for the check templates and the
 # remediation library. No network beyond 127.0.0.1; runs on macOS and Linux.
-# (check-dns needs a live resolver and check-lan-inventory needs Linux `ip`;
-# both get bash -n only, plus dns against 127.0.0.1 upstreams for the
-# UPSTREAM_DOWN path.)
+# (check-dns needs a live resolver, so it gets bash -n plus the 127.0.0.1
+# upstream case for the UPSTREAM_DOWN path; check-lan-inventory wants Linux
+# `ip` live but runs here against stub `ip`/`ping` binaries.)
 
 set -u
 REPO="$(cd "$(dirname "$0")/.." && pwd)"
@@ -64,6 +64,14 @@ assert "open port -> exit 0" 0 - -- \
     CHECK_KEY=t TCP_HOST=127.0.0.1 TCP_PORT="$PORT" bash "$CK/check-tcp-port.sh"
 assert "closed port, host pings -> PORT_CLOSED" 1 '"status": "PORT_CLOSED"' -- \
     CHECK_KEY=t TCP_HOST=127.0.0.1 TCP_PORT="$DEAD" bash "$CK/check-tcp-port.sh"
+# PING_SPLIT=0: no ping ever runs, so the HOST_DOWN detail must not claim one did
+out=$(CHECK_KEY=t TCP_HOST=127.0.0.1 TCP_PORT="$DEAD" PING_SPLIT=0 bash "$CK/check-tcp-port.sh" 2>&1); rc=$?
+if [ "$rc" = 1 ] && printf '%s' "$out" | grep -q '"status": "HOST_DOWN"' \
+        && ! printf '%s' "$out" | grep -q "not answering ping"; then
+    ok "PING_SPLIT=0 -> HOST_DOWN without the ping claim"
+else
+    bad "PING_SPLIT=0 -> HOST_DOWN without the ping claim (rc=$rc out=$out)"
+fi
 
 echo "== check-disk-space =="
 MNT="$T/vol"; mkdir -p "$MNT/BAK"
@@ -289,6 +297,45 @@ assert "default cap 2/6h -> 3rd cycle refused 75" 75 "internal rate cap" -- \
 [ "$(ha_state)" = on ] && ok "the outlet is ON after the capped runs" || bad "outlet after capped runs is $(ha_state)"
 kill "$CYC_PID" 2>/dev/null; wait "$CYC_PID" 2>/dev/null
 
+echo "== restart-systemd-unit remediation (stub systemctl) =="
+# The stub records each invocation's argv as one line, exits
+# SYSCTL_RESTART_RC for `restart` and per SYSCTL_ACTIVE for `is-active`.
+RSU="$SRCROOT/remediations/templates/restart-systemd-unit.sh"
+SCSTUB="$T/scstub"; mkdir -p "$SCSTUB"
+cat > "$SCSTUB/systemctl" <<'EOF'
+#!/bin/bash
+printf '%s\n' "$*" >> "${STUB_SYSCTL_LOG:?}"
+for a in "$@"; do case "$a" in
+    restart)   exit "${SYSCTL_RESTART_RC:-0}" ;;
+    is-active) [ "${SYSCTL_ACTIVE:-1}" = 1 ] && exit 0; exit 3 ;;
+esac; done
+exit 0
+EOF
+chmod +x "$SCSTUB/systemctl"
+SCLOG="$T/systemctl-argv.log"
+RSUENV=(PATH="$SCSTUB:$PATH" STUB_SYSCTL_LOG="$SCLOG" REMEDIATION_KEY=rsu CAP_MAX=99 UNIT=fake.service)
+: > "$SCLOG"
+assert "restart ok + unit active -> exit 0" 0 - -- "${RSUENV[@]}" bash "$RSU"
+if head -1 "$SCLOG" | grep -q "restart fake.service" && grep -q "is-active" "$SCLOG"; then
+    ok "argv log: the restart, then is-active"
+else
+    bad "argv log: the restart, then is-active (got: $(tr '\n' ';' < "$SCLOG"))"
+fi
+grep -q "RESULT service=rsu status=ok" "$SELFHEAL_AUDIT_LOG" && ok "verified success audited" || bad "verified success audited"
+: > "$SCLOG"
+assert "system scope -> exit 0" 0 - -- "${RSUENV[@]}" UNIT_SCOPE=system bash "$RSU"
+grep -q -- "--user" "$SCLOG" && bad "system scope passed --user (got: $(tr '\n' ';' < "$SCLOG"))" \
+    || ok "system scope never passes --user"
+: > "$SCLOG"
+assert "restart ok but unit never active -> exit 1" 1 - -- \
+    "${RSUENV[@]}" SYSCTL_ACTIVE=0 VERIFY_TRIES=2 VERIFY_SLEEP=0 bash "$RSU"
+grep -q "status=fail restart returned 0 but unit not active" "$SELFHEAL_AUDIT_LOG" \
+    && ok "'not active' failure audited" || bad "'not active' failure audited"
+: > "$SCLOG"
+assert "restart itself fails (5) -> exit 5" 5 - -- "${RSUENV[@]}" SYSCTL_RESTART_RC=5 bash "$RSU"
+grep -q "is-active" "$SCLOG" && bad "failed restart still ran is-active (got: $(tr '\n' ';' < "$SCLOG"))" \
+    || ok "failed restart never reaches is-active"
+
 echo "== remediation library (cap / refuse / verify) =="
 FIX="$REPO/tests/fixtures/fake-remediation.sh"
 assert "act + verify -> exit 0" 0 - -- CAP_MAX=99 bash "$FIX" "$T/fixed1"
@@ -305,6 +352,46 @@ echo "== check-dns (upstream isolation only; no live resolver assumed) =="
 assert "resolver+upstreams all dead -> UPSTREAM_DOWN" 1 '"status": "UPSTREAM_DOWN"' -- \
     CHECK_KEY=dns RESOLVER_IP=127.0.0.1 UPSTREAM1=127.0.0.1 UPSTREAM2=127.0.0.1 \
     TEST_DOMAIN=example.invalid bash "$CK/check-dns.sh"
+
+echo "== check-lan-inventory (stub ip/ping) =="
+# Stub `ip` answers `-4 addr show` with one fixed inet line (STUB_SELF_INET)
+# and `neigh show <ip>` with a configurable lladdr (STUB_NEIGH_MAC); stub
+# `ping` exits STUB_PING_RC. The inventory path carries a single quote to
+# prove both python readers take it via argv, not source interpolation.
+LANSTUB="$T/lanstub"; mkdir -p "$LANSTUB"
+cat > "$LANSTUB/ip" <<'EOF'
+#!/bin/bash
+case "$*" in
+    "-4 addr show"*)
+        echo "    inet ${STUB_SELF_INET:-192.168.9.47}/24 brd 192.168.9.255 scope global wlan0" ;;
+    "neigh show "*)
+        [ -n "${STUB_NEIGH_MAC:-}" ] && echo "$3 dev wlan0 lladdr ${STUB_NEIGH_MAC} REACHABLE" ;;
+esac
+exit 0
+EOF
+chmod +x "$LANSTUB/ip"
+cat > "$LANSTUB/ping" <<'EOF'
+#!/bin/bash
+exit "${STUB_PING_RC:-0}"
+EOF
+chmod +x "$LANSTUB/ping"
+INVQ="$T/inv'q.json"
+cat > "$INVQ" <<'EOF'
+{"self_ip": "192.168.9.47",
+ "hosts": [{"name": "nas", "ip": "192.168.9.58", "mac": "AA:BB:CC:DD:EE:FF",
+            "covered_by_service": false}]}
+EOF
+LANENV=(PATH="$LANSTUB:$PATH" CHECK_KEY=lan INVENTORY_FILE="$INVQ")
+assert "everything matches -> exit 0, no findings" 0 - -- \
+    "${LANENV[@]}" STUB_NEIGH_MAC=aa:bb:cc:dd:ee:ff bash "$CK/check-lan-inventory.sh"
+assert "different MAC answers (quoted path parsed via argv) -> DEVICE_CHANGED" 1 '"status": "DEVICE_CHANGED"' -- \
+    "${LANENV[@]}" STUB_NEIGH_MAC=11:22:33:44:55:66 bash "$CK/check-lan-inventory.sh"
+assert "self_ip absent from addr output -> SELF_IP_CHANGED" 1 '"status": "SELF_IP_CHANGED"' -- \
+    "${LANENV[@]}" STUB_NEIGH_MAC=aa:bb:cc:dd:ee:ff STUB_SELF_INET=10.0.0.5 bash "$CK/check-lan-inventory.sh"
+assert "uncovered host not pinging -> HOST_UNREACHABLE" 1 '"status": "HOST_UNREACHABLE"' -- \
+    "${LANENV[@]}" STUB_NEIGH_MAC=aa:bb:cc:dd:ee:ff STUB_PING_RC=1 bash "$CK/check-lan-inventory.sh"
+assert "inventory file missing -> CHECK_ERROR" 1 '"status": "CHECK_ERROR"' -- \
+    "${LANENV[@]}" INVENTORY_FILE="$T/absent.json" bash "$CK/check-lan-inventory.sh"
 
 echo "== approval gates: TEMPLATE + auto-pass contract =="
 GT="$SRCROOT/gates"
@@ -380,6 +467,12 @@ assert "totp client gate refuses a bad code (65)" 65 "failing closed" -- \
 assert "totp client gate refuses with no code and no tty (65)" 65 "no code supplied" -- \
     env GATE_TOTP_URL="http://127.0.0.1:$TPORT" SELFHEAL_ROOT="$FAKEROOT" \
     bash "$GT/gate-totp-remote.sh" "$FAKEROOT/remediations/fix.sh" < /dev/null
+# the verifier only knows 6-digit codes (gate-totp-server.py DIGITS=6): an
+# 8-digit code must be refused CLIENT-side, before any network attempt - the
+# URL here points at a dead port, so reaching curl would hang/fail differently
+assert "totp client gate refuses an 8-digit code pre-network (65)" 65 "malformed code (expect 6 digits)" -- \
+    env GATE_CODE=12345678 GATE_TOTP_URL="http://127.0.0.1:9" SELFHEAL_ROOT="$FAKEROOT" \
+    bash "$GT/gate-totp-remote.sh" "$FAKEROOT/remediations/fix.sh"
 kill $TOTP_PID 2>/dev/null; wait $TOTP_PID 2>/dev/null
 
 echo "== approval gates: telegram confirm (stub Bot API) =="

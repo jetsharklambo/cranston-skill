@@ -34,8 +34,10 @@ fi
 fail=0
 
 # Own address first: everything else assumes this box sits where configs say
-self_ip=$(python3 -c "import json;print(json.load(open('$INVENTORY_FILE')).get('self_ip',''))" 2>/dev/null)
-if [ -n "$self_ip" ] && ! ip -4 addr show 2>/dev/null | grep -q "inet ${self_ip}/"; then
+# The inventory path travels as sys.argv, never interpolated into Python
+# source - a quote in the path must not become code.
+self_ip=$(python3 -c 'import json,sys;print(json.load(open(sys.argv[1])).get("self_ip",""))' "$INVENTORY_FILE" 2>/dev/null)
+if [ -n "$self_ip" ] && ! ip -4 addr show 2>/dev/null | grep -qF "inet ${self_ip}/"; then
     have=$(ip -4 addr show scope global 2>/dev/null | awk '/inet /{print $2}' | paste -sd, -)
     emit "$KEY/self" "SELF_IP_CHANGED" "self" \
          "this host no longer holds ${self_ip} (has: ${have:-none}) - DHCP reassigned it; everything that targets the old address will break"
@@ -60,10 +62,10 @@ while IFS='|' read -r name ipa mac covered; do
              "a DIFFERENT device answers at ${ipa}: MAC ${seen}, expected ${want} (${name}) - DHCP likely reassigned the IP; find ${name}'s new address and fix the reservation"
         fail=1
     fi
-done < <(python3 -c "
-import json
-for h in json.load(open('$INVENTORY_FILE'))['hosts']:
-    print('|'.join([h['name'], h['ip'], h['mac'], 'true' if h.get('covered_by_service') else 'false']))
-" 2>/dev/null)
+done < <(python3 -c '
+import json, sys
+for h in json.load(open(sys.argv[1]))["hosts"]:
+    print("|".join([h["name"], h["ip"], h["mac"], "true" if h.get("covered_by_service") else "false"]))
+' "$INVENTORY_FILE" 2>/dev/null)
 
 exit $fail

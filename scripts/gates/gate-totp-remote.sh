@@ -75,9 +75,9 @@ if [ -z "$CODE" ] && [ -t 0 ]; then
     read -r CODE < /dev/tty
 fi
 case "$CODE" in
-    [0-9][0-9][0-9][0-9][0-9][0-9]|[0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9]) ;;
+    [0-9][0-9][0-9][0-9][0-9][0-9]) ;;
     "") refuse "no code supplied (pass it with the approval, e.g. 'heal <key> <code>')" ;;
-    *)  refuse "malformed code (expect 6-8 digits)" ;;
+    *)  refuse "malformed code (expect 6 digits)" ;;
 esac
 
 RESP=$(curl -s -m 10 -X POST "${GATE_TOTP_URL%/}/verify" \
