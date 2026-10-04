@@ -1,5 +1,6 @@
 {
   "_about": "Device-type knowledge for onboard/interview.py: what each shipped check template can emit, which layer each code lives at (decides which questions apply and what 'tell' means), and which shipped remediations a device can be wired to. tests/test_interview.py keeps the code lists in step with the templates' '# Findings:' headers.",
+  "_fix_fields": "script: the remediation path ({value} = the admin's answer); params: params the fix needs, from the answer; needs: params the admin must set by hand first (a missing one blocks the write); classes: which of fix/ask may wire it (refuse: the reason shown otherwise); questions: which questions accept it (how, host); local_only: it restarts something on THIS box, so a device whose target_host_param resolves to another host refuses it; ends_state: the state the fix leaves the entity in (STATE_MISMATCH with a different EXPECT_STATE is skipped); value_re/value_hint: the answer value's shape; arg: a pinned argument for the ask-first entry; option: the answer form shown in the question; what: the one-line description.",
 
   "layers": {
     "service":    "the service itself is down - a restart-type fix can apply",
@@ -18,6 +19,7 @@
     "checks/templates/check-http.sh": {
       "target": ["HTTP_URL"],
       "host_param": "HOST_IP",
+      "target_host_param": ["HOST_IP", "HTTP_URL"],
       "codes": {
         "AUTH_FAILED": "credential",
         "API_ERROR": "service",
@@ -30,6 +32,7 @@
     "checks/templates/check-tcp-port.sh": {
       "target": ["TCP_HOST", "TCP_PORT"],
       "host_param": "TCP_HOST",
+      "target_host_param": "TCP_HOST",
       "codes": {
         "PORT_CLOSED": "service",
         "HOST_DOWN": "host"
@@ -103,6 +106,9 @@
       "script": "remediations/templates/restart-systemd-unit.sh",
       "params": {"UNIT": "{value}"},
       "classes": ["fix", "ask"],
+      "questions": ["how"],
+      "local_only": true,
+      "option": "systemd:<unit>",
       "what": "restart systemd unit '{value}' on this box"
     },
     "docker": {
@@ -110,7 +116,10 @@
       "params": {"ALLOWED_CONTAINERS": "{value}"},
       "arg": "{value}",
       "classes": ["ask"],
+      "questions": ["how"],
+      "local_only": true,
       "refuse": "the docker template takes the container as its single argument, which only an ask-first entry can pin - answer 'ask', or wrap it in a fixed-content script (script:<path>) for the auto class",
+      "option": "docker:<container> (ask-first only)",
       "what": "restart local docker container '{value}'"
     },
     "ha": {
@@ -118,12 +127,41 @@
       "params": {"HA_ENTITY": "{value}"},
       "needs": ["HA_URL", "HA_TOKEN_FILE"],
       "classes": ["fix", "ask"],
+      "questions": ["how", "host"],
+      "ends_state": "on",
+      "option": "ha:<switch entity> (turn_on only)",
       "what": "Home Assistant turn_on of '{value}' (fail-safe direction only)"
+    },
+    "ssh": {
+      "script": "remediations/templates/ssh-forced-command.sh",
+      "params": {"SSH_TARGET": "{value}"},
+      "needs": ["SSH_KEY"],
+      "classes": ["fix", "ask"],
+      "questions": ["how", "host"],
+      "value_re": "^[A-Za-z0-9._-]+@[A-Za-z0-9.-]+$",
+      "value_hint": "user@host",
+      "option": "ssh:<user@host> (a forced-command key on that host)",
+      "what": "SSH forced-command on {value} (the remote key pins what runs)"
+    },
+    "outlet": {
+      "script": "remediations/templates/ha-outlet-cycle.sh",
+      "params": {"OUTLET_ENTITY": "{value}"},
+      "needs": ["HA_URL", "HA_TOKEN_FILE"],
+      "classes": ["ask"],
+      "questions": ["how", "host"],
+      "ends_state": "on",
+      "value_re": "^switch\\.[A-Za-z0-9_]+$",
+      "value_hint": "switch.<outlet>",
+      "refuse": "power-cycling an outlet cuts power - never the auto class; answer 'ask'",
+      "option": "outlet:<switch entity> (power-cycle, off-wait-on; ask-first only)",
+      "what": "power-cycle Home Assistant switch '{value}' (off, wait, on; ask-first; restore trap armed)"
     },
     "script": {
       "script": "{value}",
       "params": {},
       "classes": ["fix", "ask"],
+      "questions": ["how", "host"],
+      "option": "script:<path> [<arg>] (an ask-first entry may pin one argument)",
       "what": "your own fixed-content script '{value}'"
     }
   },
@@ -144,13 +182,13 @@
     "how": {
       "u": "U1",
       "ask": "How would I fix {name}? {options}",
-      "accepts": "systemd:<unit> | docker:<container> (ask-first only) | ha:<switch entity> (turn_on only) | script:<path to your fixed-content script> | none (tell you instead)",
+      "accepts": "systemd:<unit> | docker:<container> (ask-first only) | ha:<switch entity> (turn_on only) | ssh:<user@host> (a forced-command key on that host) | outlet:<switch entity> (power-cycle; ask-first only) | script:<path to your fixed-content script> [<arg>] (an ask-first entry may pin one argument) | none (tell you instead)",
       "maps_to": "remediations.<code> for {fixable}, plus the params the chosen template needs (REMEDIATION_KEY and the target)"
     },
     "host": {
       "u": "U1 U2",
-      "ask": "If {name}'s host ({host}) goes dark, is there a power actuator I may use - always ask-first - or would acting cut the channel you'd answer me on?",
-      "accepts": "ha:<switch entity> (turn it ON) | script:<path> | none (just tell you) | severs (never auto-propose; on-demand only)",
+      "ask": "If {name}'s host ({host}) goes dark, is there a power actuator I may use - always ask-first - or would acting cut the channel you'd answer me on? The natural answer is outlet:<switch entity> (I cycle its outlet: off, wait, on; ask-first, restore trap armed); or ha:<switch entity> to turn something ON only, ssh:<user@host> for a forced-command key on another host, script:<path>, none, or severs.",
+      "accepts": "outlet:<switch entity> (power-cycle it; ask-first) | ha:<switch entity> (turn it ON) | ssh:<user@host> (a forced-command key on another host) | script:<path> [<arg>] | none (just tell you) | severs (never auto-propose; on-demand only)",
       "maps_to": "remediations.{hostcodes}: an ask-first entry, null, or a recorded omission (on-demand class) that also goes on the doctrine never-touch list"
     },
     "consent": {

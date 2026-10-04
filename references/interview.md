@@ -42,8 +42,8 @@ is safe while it waits.
 |---|---|---|---|---|
 | `retire` | U13 | the live state shows the device failing ≥ 7 days | `retire` / `keep` | `enabled: false`; the retirement list |
 | `class` | U1 | a fixable code (service/state layer) has no decision | `fix` / `ask` / `tell` | `remediations.<code>`; unfixable layers → `null` |
-| `how` | U1 | class is fix/ask and no fix is chosen | `systemd:<unit>` / `docker:<container>` (ask-first only) / `ha:<switch>` / `script:<path>` / `none` | the fix on every fixable code, plus the params its template needs |
-| `host` | U1, U2 | the check can report a host-layer code and a host address is in params | `ha:<switch>` / `script:<path>` (both ask-first) / `none` / `severs` | an ask-first entry, `null`, or a recorded omission (on-demand class; never-touch list) |
+| `how` | U1 | class is fix/ask and no fix is chosen | `systemd:<unit>` / `docker:<container>` (ask-first only) / `ha:<switch>` (turn_on only) / `ssh:<user@host>` (a forced-command key on that host) / `outlet:<switch>` (power-cycle; ask-first only) / `script:<path> [<arg>]` (an ask-first entry may pin one argument) / `none` | the fix on every fixable code, plus the params its template needs |
+| `host` | U1, U2 | the check can report a host-layer code and a host address is in params | `outlet:<switch>` (cycle its outlet: off, wait, on — the natural answer) / `ha:<switch>` (turn it ON) / `ssh:<user@host>` / `script:<path> [<arg>]` (all ask-first) / `none` / `severs` | an ask-first entry, `null`, or a recorded omission (on-demand class; never-touch list) |
 | `consent` | U10 | an ask-first entry lacks `consent` | `admin` / `named:<person>` / `household` | `consent` on each ask-first entry, `consent_notes` |
 | `drill` | U3 | the device has a fix | `freely` / `ok` / `never` | the doctrine only |
 | `nag` | U5 | a chronic (degraded) code has no `realert_minutes_by_code` | `daily` / `hourly` / `digest` | 1440 / 60; `notify_by_code: digest` |
@@ -68,10 +68,46 @@ Rules the tool enforces:
   the same for a device whose answer simply changed.
 - **Verbatim.** The keyword at the front of an answer is what maps; the rest
   of the admin's words are kept for the doctrine and `consent_notes`.
+  Punctuation stuck to a value is dropped (`ha:switch.x.` → `switch.x`).
 - **Honest about fixes.** Nothing that cuts power is offered for the auto
-  class; the docker template is ask-first only (the container is its one
-  pinned argument); an HA fix is `turn_on` only; a bespoke check's codes must
-  be listed by hand (the tool still asks about consent and drills on it).
+  class; the docker and outlet templates are ask-first only (the container is
+  docker's one pinned argument; the outlet cycle cuts power and refuses the
+  engine's auto path even if miswired); an HA fix is `turn_on` only; an
+  `ssh:` fix can only trigger the command the remote key pins; a bespoke
+  check's codes must be listed by hand (the tool still asks about consent and
+  drills on it).
+
+Apply-time safety checks. The engine runs whatever `services.json` says, so
+`fill` refuses to be the thing that puts a wrong auto fix there. Each refusal
+is a `!` line in the fill output; the write is skipped or downgraded, never
+made quietly:
+
+1. An auto-class (string) remediation is written only for a device whose
+   admin answered `fix`. A class inferred from one hand-set auto entry may
+   steer the host and consent questions, but it does not auto-wire the
+   remaining codes — the class question comes back for that device.
+2. A `script:` fix must resolve (against the install root) to an existing
+   file, else it is skipped; an auto-class script outside `remediations/` is
+   downgraded to ask-first, because the gate's auto-pass covers nothing
+   outside that directory.
+3. `systemd:` and `docker:` restart something on *this* box, so they are
+   refused — at `answer` time and again at `fill` — for a device whose target
+   (`HOST_IP`, `TCP_HOST`, or the URL's host) is another host; `ssh:<user@host>`
+   or a script is the answer there. Loopback and this box's own addresses
+   count as local.
+4. A fix whose by-hand params are missing (`HA_URL`, `HA_TOKEN_FILE` or
+   `HA_TOKEN`, `SSH_KEY`) is not written; the note says what to set first.
+   A token never goes in the config — point at a mode-600 file.
+5. `ha:` (and `outlet:`) end with the entity ON, so `STATE_MISMATCH` is
+   skipped when the check's `EXPECT_STATE` is anything but `on`.
+6. After writing, `fill` lints the whole config the engine's way — every
+   remediation path resolves to a file, every ask-first entry has `ask`, a
+   pinned `arg` has the argument shape, every service has `name` and `check`,
+   an auto string is under `remediations/` and is not an ask-first-only
+   template — and prints the problems as `!` lines (advice: the engine keeps
+   running). A problem in a field the fill itself just wrote fails the
+   command; the checks above make that impossible by construction, so it is
+   a backstop.
 
 ## U1. Act, ask, or tell
 

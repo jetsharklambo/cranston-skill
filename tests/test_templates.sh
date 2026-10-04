@@ -142,6 +142,153 @@ assert "turn_off is structurally refused (64)" 64 "not fail-safe-direction" -- \
     HA_SERVICE=turn_off bash "$SRCROOT/remediations/templates/ha-service-call.sh"
 kill $HA_PID 2>/dev/null; wait $HA_PID 2>/dev/null
 
+echo "== ssh-forced-command remediation (stub ssh) =="
+# The stub records its argv and then "restarts the service": it opens the
+# loopback port the template verifies against (VERIFY_TCP). Nothing real is
+# contacted. STUB_SSH_RC=255 makes it fail like a refused connection.
+SSHSTUB="$T/sshstub"; mkdir -p "$SSHSTUB"
+cat > "$SSHSTUB/ssh" <<'EOF'
+#!/bin/bash
+printf '%s\n' "$@" > "${STUB_SSH_LOG:?}"
+[ "${STUB_SSH_RC:-0}" = 0 ] || exit "$STUB_SSH_RC"
+if [ -n "${STUB_LISTEN_PORT:-}" ]; then
+    python3 -c '
+import socket, sys
+s = socket.socket(); s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+s.bind(("127.0.0.1", int(sys.argv[1]))); s.listen(5); s.settimeout(20)
+try:
+    c, _ = s.accept(); c.close()
+except socket.timeout:
+    pass
+' "$STUB_LISTEN_PORT" >/dev/null 2>&1 </dev/null &
+fi
+exit 0
+EOF
+chmod +x "$SSHSTUB/ssh"
+SSHSH="$SRCROOT/remediations/templates/ssh-forced-command.sh"
+KEY="$T/id_test"; printf 'not a real key\n' > "$KEY"; chmod 600 "$KEY"
+LPORT=$(python3 -c 'import socket;s=socket.socket();s.bind(("127.0.0.1",0));print(s.getsockname()[1]);s.close()')
+ARGV="$T/ssh-argv.log"
+SSHENV=(PATH="$SSHSTUB:$PATH" STUB_SSH_LOG="$ARGV" STUB_LISTEN_PORT="$LPORT" REMEDIATION_KEY=rk CAP_MAX=99
+        SSH_TARGET=pi@host.example SSH_KEY="$KEY" VERIFY_TRIES=8 VERIFY_SLEEP=1)
+assert "forced command runs, VERIFY_TCP comes up -> exit 0" 0 - -- \
+    "${SSHENV[@]}" VERIFY_TCP="127.0.0.1:$LPORT" bash "$SSHSH" media-7
+WANT=$(printf '%s\n' -i "$KEY" -p 22 -o BatchMode=yes -o StrictHostKeyChecking=yes -o ConnectTimeout=10 pi@host.example media-7)
+[ "$(cat "$ARGV")" = "$WANT" ] && ok "ssh argv: -i key -p 22 BatchMode StrictHostKeyChecking ConnectTimeout target arg, in that order" \
+    || bad "ssh argv order (got: $(tr '\n' ' ' < "$ARGV"))"
+assert "VERIFY_URL against the loopback http server -> exit 0" 0 - -- \
+    "${SSHENV[@]}" STUB_LISTEN_PORT= VERIFY_URL="http://127.0.0.1:$PORT/" SSH_PORT=2222 SSH_CONNECT_TIMEOUT=3 \
+    SSH_KNOWN_HOSTS="$T/known" bash "$SSHSH"
+WANT=$(printf '%s\n' -i "$KEY" -p 2222 -o BatchMode=yes -o StrictHostKeyChecking=yes -o ConnectTimeout=3 -o "UserKnownHostsFile=$T/known" pi@host.example)
+[ "$(cat "$ARGV")" = "$WANT" ] && ok "no argument -> the target is the last word; port/timeout/known_hosts params land in argv" \
+    || bad "ssh argv without arg (got: $(tr '\n' ' ' < "$ARGV"))"
+assert "no VERIFY_* at all -> acts but exits 1 unverified" 1 "unverified by script" -- \
+    "${SSHENV[@]}" STUB_LISTEN_PORT= bash "$SSHSH"
+assert "ssh itself fails (255) -> exit 1" 1 "exited 255" -- \
+    "${SSHENV[@]}" STUB_SSH_RC=255 VERIFY_TCP="127.0.0.1:$LPORT" bash "$SSHSH"
+assert "missing key file -> refuse 64" 64 "no such file" -- \
+    "${SSHENV[@]}" SSH_KEY="$T/no-such-key" VERIFY_TCP="127.0.0.1:$LPORT" bash "$SSHSH"
+chmod 644 "$KEY"
+assert "world-readable key (644) -> refuse 64" 64 "mode 600" -- \
+    "${SSHENV[@]}" VERIFY_TCP="127.0.0.1:$LPORT" bash "$SSHSH"
+chmod 600 "$KEY"
+assert "SSH_TARGET without user@ -> refuse 64" 64 "user@host" -- \
+    "${SSHENV[@]}" SSH_TARGET=host.example VERIFY_TCP="127.0.0.1:$LPORT" bash "$SSHSH"
+assert "two arguments -> refuse 64" 64 "at most one argument" -- \
+    "${SSHENV[@]}" VERIFY_TCP="127.0.0.1:$LPORT" bash "$SSHSH" a b
+assert "VERIFY_TCP without a port -> refuse 64 before acting" 64 "host:port" -- \
+    "${SSHENV[@]}" VERIFY_TCP="127.0.0.1" bash "$SSHSH"
+: > "$ARGV"
+env "${SSHENV[@]}" SSH_KEY="$T/no-such-key" VERIFY_TCP="127.0.0.1:$LPORT" bash "$SSHSH" >/dev/null 2>&1
+[ ! -s "$ARGV" ] && ok "a refused run never reaches ssh" || bad "a refused run never reaches ssh"
+# default internal cap: 3 per 6h for this key, the 4th run is refused with 75
+for i in 1 2 3; do env "${SSHENV[@]}" CAP_MAX= REMEDIATION_KEY=rkcap STUB_LISTEN_PORT= bash "$SSHSH" >/dev/null 2>&1; done
+assert "default cap 3/6h -> 4th run refused 75" 75 "internal rate cap" -- \
+    "${SSHENV[@]}" CAP_MAX= REMEDIATION_KEY=rkcap STUB_LISTEN_PORT= bash "$SSHSH"
+
+echo "== ha-outlet-cycle remediation (fake HA with turn_off/turn_on, call log) =="
+# tests/fixtures/stub-ha.py only knows turn_on; the cycle needs turn_off and a
+# record of the call order, so this fake lives here.
+cat > "$T/stub-ha-cycle.py" <<'EOF'
+import json, sys
+from http.server import BaseHTTPRequestHandler, HTTPServer
+port, entity, log = int(sys.argv[1]), sys.argv[2], sys.argv[4]
+state = {"value": sys.argv[3]}
+class H(BaseHTTPRequestHandler):
+    def log_message(self, *a): pass
+    def _send(self, code, body):
+        data = json.dumps(body).encode()
+        self.send_response(code); self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(data))); self.end_headers(); self.wfile.write(data)
+    def do_GET(self):
+        if self.path == f"/api/states/{entity}":
+            self._send(200, {"entity_id": entity, "state": state["value"], "attributes": {"state": "decoy"}})
+        else:
+            self._send(404, {"message": "not found"})
+    def do_POST(self):
+        svc = self.path.rsplit("/", 1)[-1]
+        if self.path.startswith("/api/services/switch/") and svc in ("turn_on", "turn_off"):
+            body = json.loads(self.rfile.read(int(self.headers.get("Content-Length", 0)) or 0) or b"{}")
+            with open(log, "a") as f:
+                f.write(f"{svc} {body.get('entity_id')}\n")
+            state["value"] = "on" if svc == "turn_on" else "off"
+            self._send(200, [])
+        else:
+            self._send(404, {"message": "not found"})
+HTTPServer(("127.0.0.1", port), H).serve_forever()
+EOF
+CYCLE="$SRCROOT/remediations/templates/ha-outlet-cycle.sh"
+CPORT=$(python3 -c 'import socket;s=socket.socket();s.bind(("127.0.0.1",0));print(s.getsockname()[1]);s.close()')
+CALLS="$T/ha-calls.log"
+ha_cycle_stub() {  # <initial state> - (re)start the fake HA serving switch.tv in that state, empty call log
+    [ -n "${CYC_PID:-}" ] && { kill "$CYC_PID" 2>/dev/null; wait "$CYC_PID" 2>/dev/null; }
+    : > "$CALLS"
+    python3 "$T/stub-ha-cycle.py" "$CPORT" switch.tv "$1" "$CALLS" &
+    CYC_PID=$!
+    for i in 1 2 3 4 5 6 7 8 9 10; do curl -s -o /dev/null "http://127.0.0.1:$CPORT/api/states/switch.tv" && break; sleep 0.3; done
+}
+ha_state() { curl -s "http://127.0.0.1:$CPORT/api/states/switch.tv" | python3 -c 'import json,sys; print(json.load(sys.stdin)["state"])'; }
+CYCENV=(REMEDIATION_KEY=tv HA_URL="http://127.0.0.1:$CPORT" HA_TOKEN=x OUTLET_ENTITY=switch.tv CAP_MAX=99
+        CYCLE_OFF_SECONDS=1 VERIFY_TRIES=3 VERIFY_SLEEP=0)
+ha_cycle_stub on
+assert "outlet on: off, wait, on, verified -> exit 0" 0 - -- "${CYCENV[@]}" bash "$CYCLE"
+[ "$(cat "$CALLS")" = "$(printf 'turn_off switch.tv\nturn_on switch.tv')" ] && ok "call order is exactly turn_off then turn_on" \
+    || bad "call order (got: $(tr '\n' ' ' < "$CALLS"))"
+[ "$(ha_state)" = on ] && ok "the outlet ends ON" || bad "the outlet ends ON (is $(ha_state))"
+grep -q "RESULT service=tv status=ok" "$SELFHEAL_AUDIT_LOG" && ok "success audited" || bad "success audited"
+: > "$CALLS"
+assert "SELFHEAL_AUTOMATION=true (the engine's auto path) -> refuse 64" 64 "ask-first only" -- \
+    "${CYCENV[@]}" SELFHEAL_AUTOMATION=true bash "$CYCLE"
+[ ! -s "$CALLS" ] && ok "...and HA was not called at all" || bad "auto path made HA calls: $(cat "$CALLS")"
+assert "a non-switch entity -> refuse 64" 64 "not a switch" -- "${CYCENV[@]}" OUTLET_ENTITY=light.tv bash "$CYCLE"
+assert "an entity HA does not know -> refuse 64 (cannot read)" 64 "cannot read" -- "${CYCENV[@]}" OUTLET_ENTITY=switch.nope bash "$CYCLE"
+assert "CYCLE_OFF_SECONDS over 60 -> refuse 64" 64 "60s maximum" -- "${CYCENV[@]}" CYCLE_OFF_SECONDS=90 bash "$CYCLE"
+assert "HA unreachable -> refuse 64, no power cut" 64 "cannot read" -- "${CYCENV[@]}" HA_URL="http://127.0.0.1:$DEAD" bash "$CYCLE"
+[ ! -s "$CALLS" ] && ok "no refusal made an HA call" || bad "a refusal made HA calls: $(cat "$CALLS")"
+ha_cycle_stub off
+assert "outlet already off -> refuse 64 (restore path unproven)" 64 "not 'on'" -- "${CYCENV[@]}" bash "$CYCLE"
+[ ! -s "$CALLS" ] && ok "...and nothing was switched" || bad "an off outlet was switched: $(cat "$CALLS")"
+# killed mid-cycle: the restore trap must put the outlet back ON (TERM after
+# ~2s of a 30s off period; a plain kill, no `timeout`, so it runs on macOS too)
+ha_cycle_stub on
+env "${CYCENV[@]}" CYCLE_OFF_SECONDS=30 bash "$CYCLE" >/dev/null 2>&1 &
+CYCRUN=$!
+for i in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20; do grep -q turn_off "$CALLS" 2>/dev/null && break; sleep 0.2; done
+sleep 1
+kill -TERM "$CYCRUN" 2>/dev/null
+wait "$CYCRUN" 2>/dev/null; CYCRC=$?
+[ "$CYCRC" = 143 ] && ok "killed mid-cycle: exits 143 promptly (1s wait slices)" || bad "killed mid-cycle rc=$CYCRC"
+[ "$(cat "$CALLS")" = "$(printf 'turn_off switch.tv\nturn_on switch.tv')" ] && ok "killed mid-cycle: the trap re-asserted turn_on" \
+    || bad "killed mid-cycle: calls were $(tr '\n' ' ' < "$CALLS")"
+[ "$(ha_state)" = on ] && ok "killed mid-cycle: the outlet is back ON" || bad "killed mid-cycle: outlet is $(ha_state)"
+grep -q "RESTORE service=tv action=turn_on" "$SELFHEAL_AUDIT_LOG" && ok "the trap's restore is audited" || bad "the trap's restore is audited"
+# default internal cap: 2 per 6h for this key, the 3rd cycle is refused with 75
+for i in 1 2; do env "${CYCENV[@]}" CAP_MAX= REMEDIATION_KEY=tvcap CYCLE_OFF_SECONDS=0 bash "$CYCLE" >/dev/null 2>&1; done
+assert "default cap 2/6h -> 3rd cycle refused 75" 75 "internal rate cap" -- \
+    "${CYCENV[@]}" CAP_MAX= REMEDIATION_KEY=tvcap CYCLE_OFF_SECONDS=0 bash "$CYCLE"
+[ "$(ha_state)" = on ] && ok "the outlet is ON after the capped runs" || bad "outlet after capped runs is $(ha_state)"
+kill "$CYC_PID" 2>/dev/null; wait "$CYC_PID" 2>/dev/null
+
 echo "== remediation library (cap / refuse / verify) =="
 FIX="$REPO/tests/fixtures/fake-remediation.sh"
 assert "act + verify -> exit 0" 0 - -- CAP_MAX=99 bash "$FIX" "$T/fixed1"

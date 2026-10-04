@@ -32,6 +32,15 @@ catalog does not know is still handled for what the config shows (consent on
 its ask-first entries, drill policy) - its codes have to be listed in
 `remediations` by hand (null = tell-only).
 
+`fill` also refuses to write a remediation the engine would run wrongly: an
+auto-class string needs the admin's explicit `fix` (never a class inferred
+from one hand-set entry), must point at an existing script under
+remediations/ (the gate's auto-pass covers nothing else), may not restart
+something on this box for a device that lives on another host, needs its
+by-hand params (HA_URL, a token FILE, an SSH key) present first, and never
+turns ON an entity the check expects OFF. Each refusal is a `!` line; after
+--apply a structural lint of the written config is printed.
+
 Paths: --config (default <install-root>/services.json), --answers (default
 <config dir>/interview.json); live state is read from the config's
 paths.state_dir when present. Stdlib only; python3 3.9+.
@@ -39,31 +48,52 @@ paths.state_dir when present. Stdlib only; python3 3.9+.
 
 import argparse
 import fcntl
+import ipaddress
 import json
 import os
 import re
 import shutil
+import socket
 import sys
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from urllib.parse import urlsplit
 
 BASE = Path(__file__).resolve().parent          # onboard/
 ROOT = BASE.parent                              # install root
 CATALOG = json.loads((BASE / "catalog.json").read_text())
 FIXABLE = set(CATALOG["fixable_layers"])
+FIXES = CATALOG["fixes"]
 
 # ask order within one device: a retirement question may make the rest moot
 KINDS = ["retire", "class", "how", "host", "consent", "drill", "nag"]
 
+# The one argument a remediation may take. Keep the text identical to
+# engine/selfheal.py's ARG_RE: a pinned "arg" the engine would refuse is a
+# config bug the interview must never write.
+ARG_RE = r"[A-Za-z0-9][A-Za-z0-9._@:-]{0,63}"
+
+
+def _kinds(question):
+    """The fix kinds the catalog lets a question accept (grammar alternation)."""
+    return "|".join(k for k, f in FIXES.items() if question in f.get("questions", ["how"]))
+
+
 GRAMMAR = {
     "retire":  r"^(retire|keep)\b",
     "class":   r"^(fix|ask|tell)\b",
-    "how":     r"^(?:(systemd|docker|ha|script):(\S+)|(none)\b)",
-    "host":    r"^(?:(ha|script):(\S+)|(none|severs)\b)",
+    "how":     rf"^(?:({_kinds('how')}):(\S+)|(none)\b)",
+    "host":    rf"^(?:({_kinds('host')}):(\S+)|(none|severs)\b)",
     "consent": r"^(?:(named):(\S+)|(admin|household)\b)",
     "drill":   r"^(freely|ok|never)\b",
     "nag":     r"^(daily|hourly|digest)\b",
 }
+# what an admin's sentence leaves stuck to a value: "ha:switch.x." -> switch.x
+VALUE_STRIP_LEAD, VALUE_STRIP_TAIL = "'\"([{", ".,;:!?)]}'\""
+# a pinned arg must be the last word, or set off from the admin's words by one of these
+ARG_SEPARATORS = "-—–:;,|(\"'"
+# a `needs` param satisfied by an alternative the admin set instead
+ALT_PARAMS = {"HA_TOKEN_FILE": ("HA_TOKEN",)}
 
 RETIRE_DAYS = int(os.environ.get("INTERVIEW_RETIRE_DAYS", "7"))
 OMIT = object()   # "decided: leave this code out of the map" (on-demand class)
@@ -102,6 +132,87 @@ def save_json(path, data):
         json.dump(data, f, indent=2, ensure_ascii=False)
         f.write("\n")
     os.replace(tmp, path)
+
+
+def resolve(p, root):
+    """A config path the way the engine resolves it: relative to the install root."""
+    p = Path(p)
+    return (p if p.is_absolute() else root / p).resolve()
+
+
+def under_remediations(path, root):
+    """True when `path` sits under <root>/remediations/ - the only place the
+    approval gate's auto-pass covers; an auto string anywhere else can never
+    run unattended (and an auto string IS a request to run unattended)."""
+    try:
+        return Path(path).resolve().is_relative_to((root / "remediations").resolve())
+    except (OSError, ValueError):
+        return False
+
+
+def clean_value(v):
+    """Strip what an admin's sentence leaves stuck to a value ("ha:switch.x." -> switch.x)."""
+    if not v:
+        return v
+    return v.lstrip(VALUE_STRIP_LEAD).rstrip(VALUE_STRIP_TAIL)
+
+
+def host_of(value):
+    """The host part of a params value: a URL's hostname, else the value itself
+    (a bare address, [v6] brackets dropped)."""
+    if not value:
+        return None
+    if "://" in value:
+        try:
+            return urlsplit(value).hostname
+        except ValueError:
+            return None
+    return value.strip("[]") or None
+
+
+def is_local_address(host):
+    """True when `host` names THIS box: loopback, or an address the kernel
+    routes to itself. The UDP connect sends nothing - it only asks the routing
+    table which source address it would use, and that is the target itself
+    exactly when the target is one of our own addresses. A name that does not
+    resolve counts as remote: the restart would run here, blind."""
+    h = (host or "").strip().strip("[]").lower()
+    if not h:
+        return False
+    if h in ("localhost", "localhost.localdomain"):
+        return True
+    try:
+        addrs = [str(ipaddress.ip_address(h))]
+    except ValueError:
+        try:
+            addrs = sorted({i[4][0] for i in socket.getaddrinfo(h, None)})
+        except OSError:
+            return False
+    for a in addrs:
+        try:
+            ip = ipaddress.ip_address(a)
+        except ValueError:
+            continue
+        if ip.is_loopback:
+            return True
+        s = socket.socket(socket.AF_INET6 if ip.version == 6 else socket.AF_INET, socket.SOCK_DGRAM)
+        try:
+            s.connect((a, 9))
+            if s.getsockname()[0] == a:
+                return True
+        except OSError:
+            pass
+        finally:
+            s.close()
+    return False
+
+
+def has_param(params, need):
+    return need in params or any(alt in params for alt in ALT_PARAMS.get(need, ()))
+
+
+def fix_params(kind, value):
+    return {k: v.format(value=value) for k, v in FIXES[kind]["params"].items()}
 
 
 # ---- the deployment ---------------------------------------------------------
@@ -257,9 +368,28 @@ class Device:
         return bool(self.tpl and self.tpl.get("host_param") in self.params
                     and self.codes_at("host"))
 
+    def target_host(self):
+        """Where this device's service runs, from the template's
+        target_host_param (a name or an ordered list; a URL counts by its
+        hostname). None when the catalog has no idea (a local check)."""
+        tp = self.tpl.get("target_host_param") if self.tpl else None
+        for name in ([tp] if isinstance(tp, str) else (tp or [])):
+            h = host_of(self.params.get(name))
+            if h:
+                return h
+        return None
+
+    def is_remote(self):
+        """True when the device's target is another host - a restart on THIS
+        box cannot be its fix. None when the target host is unknown."""
+        h = self.target_host()
+        if h is None:
+            return None
+        return not is_local_address(h)
+
     def will_have_fix(self):
         """A remediation exists or is about to be written from an answer."""
-        if self.ans("class") == "tell" and self.ans("host") not in ("ha", "script"):
+        if self.ans("class") == "tell" and self.ans("host") not in FIXES:
             # every open fixable code is about to become null; only fixes the
             # interview may not touch (hand-set) remain
             return any(v is not None and not self.is_open(f"remediations.{c}")
@@ -270,7 +400,7 @@ class Device:
         if how and how != "none":
             return True
         host = self.ans("host")
-        return bool(host and host in ("ha", "script"))
+        return bool(host and host in FIXES)
 
     def will_have_ask_without_consent(self):
         if any(isinstance(v, dict) and "consent" not in v for v in self.rem.values()):
@@ -279,7 +409,13 @@ class Device:
             return False
         if self.effective_class() == "ask" and self.ans("how") not in (None, "none"):
             return True
-        return self.ans("host") in ("ha", "script")
+        return self.ans("host") in FIXES
+
+    def class_is_inferred(self):
+        """The auto class came from a hand-set string, not from an answer. It
+        may steer the host and consent questions, but `fill` will not wire more
+        codes to auto on its strength - the admin says `fix` for the device."""
+        return self.effective_class() == "fix" and not self.ans("class")
 
     def _live(self):
         """What the engine's state says right now: failing keys, pending asks,
@@ -336,6 +472,10 @@ class Device:
                 out.append("retire")
         if self.applies("class") and cls is None:
             out.append("class")
+        elif (self.applies("class") and self.class_is_inferred()
+                and self.undecided(*FIXABLE)):
+            # one hand-set auto string must not auto-wire the rest: confirm it
+            out.append("class")
         if (self.applies("how") and cls in ("fix", "ask") and not self.ans("how")
                 and self.undecided(*FIXABLE)):
             out.append("how")
@@ -375,6 +515,10 @@ class Device:
         if und and self.effective_class() is None:
             score += 30
             why.append(f"no fix/ask/tell decision for {', '.join(und)}")
+        elif und and self.class_is_inferred():
+            score += 30
+            why.append(f"its auto class is inferred from a hand-set entry - confirm fix/ask "
+                       f"before {', '.join(und)} are wired the same way")
         if self.will_have_ask_without_consent() and not self.ans("consent"):
             score += 25
             why.append("an ask-first fix with no consent scope")
@@ -393,14 +537,17 @@ class Device:
     def question(self, kind):
         q = CATALOG["questions"][kind]
         fixable = ", ".join(self.fixable_codes) or "nothing fixable"
-        options = ("systemd:<unit> · docker:<container> (ask-first only) · "
-                   "ha:<switch entity> (turn_on only) · script:<path> · none")
+        options = " · ".join(f["option"] for k, f in FIXES.items()
+                             if "how" in f.get("questions", ["how"])) + " · none"
         df = self.tpl.get("default_fix") if self.tpl else None
         if df:
             if df.get("from_param") and df["from_param"] in self.params:
                 options = f"{df['kind']}:{self.params[df['from_param']]} is the obvious one; or {options}"
             else:
                 options = f"{df['kind']}:<the switch to turn on> is the natural fit here; or {options}"
+        if kind == "how" and self.is_remote():
+            options += (f" ({self.name} runs on {self.target_host()}, not this box: systemd:/docker: "
+                        f"do not apply - ssh:<user@host> runs a forced-command key there)")
         since = self.live["since"]
         root = self.dep.state.get(self.name, {})
         fields = {
@@ -440,14 +587,26 @@ def ranked(dep):
 
 def parse_answer(kind, text):
     """Keyword-first grammar: the first token(s) decide the mapping; the rest of
-    the admin's words are kept verbatim for the doctrine."""
-    m = re.match(GRAMMAR[kind], text.strip(), re.IGNORECASE)
+    the admin's words are kept verbatim for the doctrine. Returns (key, value,
+    arg): the value with stray punctuation stripped ("ha:switch.x." ->
+    switch.x); `arg` only for `script:<path> <arg>` - an ARG_RE-shaped word
+    right after the path that is the last word or is set off from the admin's
+    words by punctuation (so "script:x.sh because ..." pins nothing)."""
+    text = text.strip()
+    m = re.match(GRAMMAR[kind], text, re.IGNORECASE)
     if not m:
         return None
     groups = [g for g in m.groups() if g]
     key = groups[0].lower()
-    value = groups[1] if len(groups) > 1 else None
-    return key, value
+    value = clean_value(groups[1]) if len(groups) > 1 else None
+    if len(groups) > 1 and not value:
+        return None
+    arg = None
+    if key == "script" and kind in ("how", "host"):
+        rest = text[m.end():].split(None, 1)
+        if rest and re.fullmatch(ARG_RE, rest[0]) and (len(rest) == 1 or rest[1][0] in ARG_SEPARATORS):
+            arg = rest[0]
+    return key, value, arg
 
 
 def cmd_answer(dep, args):
@@ -462,19 +621,32 @@ def cmd_answer(dep, args):
     if not parsed:
         die(f"could not read that as a '{args.kind}' answer. Accepted: "
             f"{CATALOG['questions'][args.kind]['accepts']}", 64)
-    key, value = parsed
-    if args.kind == "how" and key != "none":
-        fix = CATALOG["fixes"][key]
-        cls = dev.effective_class()
+    key, value, arg = parsed
+    if args.kind in ("how", "host") and key in FIXES:
+        # refuse now what `fill` would refuse later, with the same reasons
+        fix = FIXES[key]
+        if fix.get("value_re") and not re.match(fix["value_re"], value):
+            die(f"{key}:{value} - the value must look like {fix['value_hint']}", 64)
+        cls = "ask" if args.kind == "host" else dev.effective_class()
         if cls and cls not in fix["classes"]:
             die(f"{key}: {fix['refuse']}", 64)
+        if arg and cls == "fix":
+            die(f"{key}:{value} {arg}: an auto-class string cannot carry a pinned argument - "
+                f"answer 'ask' for {dev.name}, or bake the target into the script", 64)
+        if fix.get("local_only") and dev.is_remote():
+            die(f"{key}: {Path(fix['script']).name} restarts something on THIS box, but {dev.name} "
+                f"runs on {dev.target_host()} - use ssh:<user@host> (a forced-command key there) "
+                f"or a script", 64)
     record = {"key": key, "value": value, "text": args.text.strip(), "at": iso(now()),
               "question": dev.question(args.kind)["ask"]}
+    if arg:
+        record["arg"] = arg
     dep.answers["devices"].setdefault(dev.name, {})[args.kind] = record
     dep.save_answers()
     fresh = Device(dep, svc)
     nxt = fresh.open_kinds()
-    print(f"recorded {dev.name}:{args.kind} = {key}" + (f" ({value})" if value else ""))
+    print(f"recorded {dev.name}:{args.kind} = {key}" + (f" ({value})" if value else "")
+          + (f" arg={arg}" if arg else ""))
     if nxt:
         print(f"next for {dev.name}: {nxt[0]}   (python3 {sys.argv[0]} next --device {dev.name})")
     else:
@@ -517,9 +689,14 @@ def fmt(v):
 def plan_device(dev):
     """Return (changes, kept, notes). `changes` are writes the rules allow;
     `kept` are fields the interview wanted but may not touch: set by hand, or
-    its own earlier fill on a device that is not being redone."""
+    its own earlier fill on a device that is not being redone. `notes` are the
+    `!` lines: every write a safety check refused or downgraded says so here -
+    nothing unsafe is left out quietly."""
     svc, rem, prov, params = dev.svc, dev.rem, dev.prov, dict(dev.svc.get("params", {}))
+    root = dev.dep.root
     changes, kept, notes = [], [], []
+    cls = dev.effective_class()
+    a_class, a_how, a_host = dev.ans("class"), dev.ans("how"), dev.ans("host")
 
     def want(path, new, why):
         """Register one desired write, applying the overwrite rules."""
@@ -546,8 +723,59 @@ def plan_device(dev):
         changes.append(Change(path, params.get(k), v, why, k in params))
 
     def wire_fix(fix_key, value, cls, codes, why, arg=None):
-        fix = CATALOG["fixes"][fix_key]
+        """Wire one fix to `codes` - after the apply-time safety checks. A
+        check that fails leaves a `!` note and skips the write (or downgrades
+        it to ask-first); the engine runs whatever is in services.json, so
+        the interview must never be the one that put a wrong auto fix there."""
+        fix = FIXES[fix_key]
         script = fix["script"].format(value=value)
+        label = Path(script).name
+        if not codes:
+            return
+        # C1: an auto string needs the admin's explicit `fix` - a class
+        # inferred from one hand-set entry does not auto-wire the rest
+        if cls == "fix" and a_class != "fix":
+            notes.append(f"{why}: {', '.join(codes)} NOT auto-wired - class=fix was inferred from a "
+                         f"hand-set entry, not answered; `answer {dev.name} class fix` (or ask) first")
+            return
+        # C2: the script must exist, and an auto string must sit under
+        # remediations/ - the gate's auto-pass covers nothing else
+        target = resolve(script, root)
+        if not target.is_file():
+            notes.append(f"{why}: not written - {script} is not a file (looked at {target}); "
+                         f"put the script there first, then fill again")
+            return
+        if cls == "fix" and not under_remediations(target, root):
+            notes.append(f"{why}: {script} is outside {root / 'remediations'}/ - the gate's auto-pass "
+                         f"only covers remediations/; wired ask-first instead")
+            cls = "ask"
+        if cls == "fix" and arg:
+            notes.append(f"{why}: not written - an auto-class string cannot carry the pinned argument "
+                         f"'{arg}'; answer `ask`, or bake the target into the script")
+            return
+        # C3: a restart on THIS box is no fix for a service on another host
+        if fix.get("local_only") and dev.is_remote():
+            notes.append(f"{why}: not written - {label} restarts something on this box, but {dev.name} "
+                         f"runs on {dev.target_host()}; use ssh:<user@host> (a forced-command key "
+                         f"there) or a script")
+            return
+        # C4: the by-hand params first - never a token in the config
+        missing = [n for n in fix.get("needs", []) if not has_param(params, n)]
+        if missing:
+            notes.append(f"{why}: not written until params.{' and params.'.join(missing)} are set by hand "
+                         f"for {label} (never put a token in the config - point at a mode-600 file); "
+                         f"then run fill again")
+            return
+        # C5: a fix that leaves the entity ON is the wrong direction for a
+        # STATE_MISMATCH whose expected state is anything else
+        expect = params.get("EXPECT_STATE")
+        if (fix.get("ends_state") and "STATE_MISMATCH" in codes
+                and expect is not None and str(expect) != fix["ends_state"]):
+            codes = [c for c in codes if c != "STATE_MISMATCH"]
+            notes.append(f"{why}: STATE_MISMATCH skipped - EXPECT_STATE={expect} but {label} leaves the "
+                         f"entity {fix['ends_state']} (the wrong direction); null it by hand or choose a script")
+            if not codes:
+                return
         if cls == "fix":
             new = script
         else:
@@ -563,15 +791,8 @@ def plan_device(dev):
         for code in codes:
             want(f"remediations.{code}", new, why)
         want_param("REMEDIATION_KEY", dev.name, why)
-        for k, v in fix["params"].items():
-            want_param(k, v.format(value=value), why)
-        for need in fix.get("needs", []):
-            if need not in params and not (need == "HA_TOKEN_FILE" and "HA_TOKEN" in params):
-                notes.append(f"params.{need} must be set by hand for {Path(script).name} "
-                             f"(never put a token in the config - point at a mode-600 file)")
-
-    cls = dev.effective_class()
-    a_class, a_how, a_host = dev.ans("class"), dev.ans("how"), dev.ans("host")
+        for k, v in fix_params(fix_key, value).items():
+            want_param(k, v, why)
 
     # retire ------------------------------------------------------------------
     if dev.ans("retire") == "retire":
@@ -589,12 +810,12 @@ def plan_device(dev):
             for code in dev.undecided(*FIXABLE):
                 want(f"remediations.{code}", None, "how=none")
         elif a_how:
-            fix = CATALOG["fixes"][a_how]
+            fix = FIXES[a_how]
             if cls not in fix["classes"]:
                 notes.append(f"how={a_how} refused for class={cls}: {fix['refuse']}")
             else:
                 wire_fix(a_how, dev.ans_value("how"), cls, dev.undecided(*FIXABLE),
-                         f"class={cls}, how={a_how}")
+                         f"class={cls}, how={a_how}", arg=dev.answers["how"].get("arg"))
         # the layers no fix can touch: tell-only, now that the stance is known
         for code in dev.undecided("credential", "upstream", "hardware", "sensor", "inventory"):
             want(f"remediations.{code}", None, f"class={cls} (unfixable layer)")
@@ -605,13 +826,21 @@ def plan_device(dev):
         elif a_host == "severs":
             for code in dev.undecided("host"):
                 want(f"remediations.{code}", OMIT, "host=severs (on-demand only; never-touch list)")
-        elif a_host in ("ha", "script"):
+        elif a_host in FIXES:
             value = dev.ans_value("host")
-            if a_host == "ha" and a_how == "ha" and dev.ans_value("how") != value:
-                notes.append(f"host=ha:{value} conflicts with how=ha:{dev.ans_value('how')} - one "
-                             f"HA_ENTITY per service; give the host actuator its own service or a script")
+            # one value per param per service: a how= and a host= fix that both
+            # set e.g. HA_ENTITY would overwrite each other
+            clash = None
+            if a_how in FIXES:
+                ph, pt = fix_params(a_how, dev.ans_value("how")), fix_params(a_host, value)
+                clash = next((k for k in pt if k in ph and ph[k] != pt[k]), None)
+            if clash:
+                notes.append(f"host={a_host}:{value} conflicts with how={a_how}:{dev.ans_value('how')} - "
+                             f"both set params.{clash}, one per service; give the host actuator its own "
+                             f"service or a script")
             else:
-                wire_fix(a_host, value, "ask", dev.undecided("host"), f"host={a_host} (ask-first)")
+                wire_fix(a_host, value, "ask", dev.undecided("host"), f"host={a_host} (ask-first)",
+                         arg=dev.answers["host"].get("arg"))
 
     # consent -----------------------------------------------------------------
     if dev.ans("consent"):
@@ -664,6 +893,87 @@ def apply_changes(svc, changes):
         prov[ch.path] = {"at": stamp, "why": ch.why, "value": ch.new}
 
 
+def lint_config(config, root):
+    """Structural lint of a services.json, the engine's view: every remediation
+    path (auto string or ask-first "ask") resolves to a file, an auto string
+    sits under remediations/ and is not an ask-first-only template, every
+    ask-first entry has "ask", a pinned "arg" is ARG_RE-shaped, every service
+    has name and check. Advice, not enforcement: the engine keeps running on a
+    config with these problems - badly. Returns [(service, field, problem)]."""
+    problems = []
+    ask_only = {resolve(f["script"], root): k for k, f in FIXES.items()
+                if "{value}" not in f["script"] and "fix" not in f["classes"]}
+    for i, svc in enumerate(config.get("services", [])):
+        if not isinstance(svc, dict):
+            problems.append((f"services[{i}]", "", "not an object"))
+            continue
+        name = svc.get("name")
+        label = name if isinstance(name, str) and name else f"services[{i}]"
+        if not (isinstance(name, str) and name):
+            problems.append((label, "name", "missing or not a string"))
+        if not (isinstance(svc.get("check"), str) and svc["check"]):
+            problems.append((label, "check", "missing or not a string"))
+        rem = svc.get("remediations")
+        if rem is None:
+            continue
+        if not isinstance(rem, dict):
+            problems.append((label, "remediations", "must be an object: code -> entry"))
+            continue
+        for code, v in rem.items():
+            field = f"remediations.{code}"
+            if v is None:
+                continue
+            if isinstance(v, str):
+                path = resolve(v, root)
+                if not path.is_file():
+                    problems.append((label, field, f"auto script {v} is not a file ({path})"))
+                elif not under_remediations(path, root):
+                    problems.append((label, field, f"auto script {v} is outside remediations/ - "
+                                                   f"the gate's auto-pass never runs it"))
+                elif path in ask_only:
+                    problems.append((label, field, f"{Path(v).name} is ask-first only (it refuses the "
+                                                   f"auto path) - wire it as {{\"ask\": ...}}"))
+                continue
+            if isinstance(v, dict):
+                ask = v.get("ask")
+                if not (isinstance(ask, str) and ask):
+                    problems.append((label, field, "an ask-first entry needs \"ask\": <script path>"))
+                elif not resolve(ask, root).is_file():
+                    problems.append((label, field, f"ask script {ask} is not a file ({resolve(ask, root)})"))
+                if "arg" in v and not (isinstance(v["arg"], str) and re.fullmatch(ARG_RE, v["arg"])):
+                    problems.append((label, field, f"pinned arg {v['arg']!r} must match {ARG_RE} - "
+                                                   f"the engine ignores it with a WARN"))
+                c = v.get("consent")
+                if c is not None and not (c in ("admin", "household")
+                                          or (isinstance(c, str) and c.startswith("named:") and len(c) > 6)):
+                    problems.append((label, field, f"consent {c!r} is not admin | household | named:<person>"))
+                continue
+            problems.append((label, field, f"{type(v).__name__} is not a remediation entry "
+                                           f"(a script path, {{\"ask\": ...}} or null)"))
+    return problems
+
+
+def report_lint(dep, where, written_fields):
+    """Print the lint of the config just written; a problem in a field THIS
+    fill wrote is a bug in the interview (the checks above should make it
+    impossible) and fails the command - the file stays written, backup kept."""
+    problems = lint_config(dep.config, dep.root)
+    entries = sum(len(s.get("remediations") or {}) for s in dep.config.get("services", [])
+                  if isinstance(s, dict))
+    if not problems:
+        print(f"lint: ok - {len(dep.config.get('services', []))} service(s), {entries} remediation "
+              f"entr{'y' if entries == 1 else 'ies'}, every path resolves")
+        return
+    print(f"lint: {len(problems)} problem(s) in {where} (advice: the engine keeps running, badly, "
+          f"until they are fixed by hand)")
+    for svc_name, field, msg in problems:
+        print(f"  ! {svc_name}: {field}: {msg}")
+    fatal = [p for p in problems if (p[0], p[1]) in written_fields]
+    if fatal:
+        die(f"{len(fatal)} lint problem(s) sit in field(s) this fill just wrote - the safety checks "
+            f"should make that impossible; keep the backup and report it", 1)
+
+
 def cmd_fill(dep, args):
     if args.overwrite and not args.device:
         die("--overwrite needs --device: the interview only revises its own fills, one device at a time")
@@ -671,7 +981,7 @@ def cmd_fill(dep, args):
         targets = [Device(dep, dep.service(args.device), redo=args.overwrite)]
     else:
         targets = devices(dep)
-    total, any_kept, written = 0, False, []
+    total, any_kept, written, written_fields = 0, False, [], set()
     for dev in targets:
         changes, kept, notes = plan_device(dev)
         if not (changes or kept or notes):
@@ -690,6 +1000,7 @@ def cmd_fill(dep, args):
             apply_changes(dev.svc, changes)
             total += len(changes)
             written.append(dev.name)
+            written_fields |= {(dev.name, ch.path) for ch in changes}
     if not total:
         print("nothing to fill" + (" (fields the interview may not touch were left alone)" if any_kept else
                                    " - every answer is already in the config"))
@@ -705,11 +1016,13 @@ def cmd_fill(dep, args):
             dep.answers["reask"] = [n for n in reask if n not in written]
             dep.save_answers()
         print(f"applied {total} change(s) to {dep.config_path} (backup: {backup.name})")
+        report_lint(dep, dep.config_path, written_fields)
         print("verify: python3 engine/selfheal.py --once   and read state/state.json")
     else:
         draft = dep.config_path.with_name(dep.config_path.stem + ".draft.json")
         save_json(draft, dep.config)
         print(f"wrote {total} change(s) to {draft} - services.json untouched; re-run with --apply to write it")
+        report_lint(dep, draft, written_fields)
 
 
 # ---- plan / next / status -----------------------------------------------------------

@@ -10,6 +10,7 @@ Also keeps onboard/catalog.json in step with the check templates' headers and
 with references/interview.md. Stdlib only.
 """
 import json
+import os
 import re
 import shutil
 import subprocess
@@ -77,7 +78,12 @@ ok(shipped == set(CATALOG["templates"]), "every shipped check template is in the
    f"missing {sorted(shipped - set(CATALOG['templates']))}")
 for key, fix in CATALOG["fixes"].items():
     if key != "script":
-        ok((SCRIPTS / fix["script"]).exists(), f"fix '{key}' points at a shipped remediation")
+        p = SCRIPTS / fix["script"]
+        ok(p.exists() and os.access(p, os.X_OK), f"fix '{key}' points at a shipped, executable remediation")
+    ok("fix" in fix["classes"] or "refuse" in fix, f"fix '{key}': an ask-first-only fix carries its refuse text")
+    ok("option" in fix and set(fix.get("questions", ["how"])) <= {"how", "host"},
+       f"fix '{key}': has an option text and names the questions that accept it")
+ok(CATALOG["fixes"]["outlet"]["classes"] == ["ask"], "the outlet cycle is ask-first only in the catalog")
 
 print("== catalog questions cite real interview.md questions ==")
 interview_md = (REPO / "authoring" / "references" / "interview.md").read_text()
@@ -93,6 +99,18 @@ DEPLOY = tmp / "deploy"
 shutil.copytree(SCRIPTS, DEPLOY)
 TOOL = DEPLOY / "onboard" / "interview.py"
 CFG = DEPLOY / "services.json"
+
+
+def stub_script(rel):
+    """A fixed-content script the admin 'wrote' (a script: answer must resolve to a file)."""
+    p = DEPLOY / rel
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_text("#!/bin/bash\n# test stub: a fixed-content remediation\nexit 0\n")
+    p.chmod(0o755)
+
+
+for rel in ("remediations/restart-media.sh", "remediations/nas-restart.sh", "bin/outside-restart.sh"):
+    stub_script(rel)
 
 
 def run(*args, expect=0):
@@ -173,8 +191,13 @@ ok(q["kind"] == "how" and "systemd:openclaw-gateway is the obvious one" in q["as
 run("answer", "gateway", "how", "systemd:openclaw-gateway")
 run("answer", "gateway", "drill", "freely")
 run("answer", "media-server", "class", "ask")
-r = run("answer", "media-server", "how", "docker:navidrome", expect=0)
-ok(r.returncode == 0, "docker fix accepted for ask-first")
+q = json.loads(run("next", "--device", "media-server", "--json").stdout)
+ok(q["kind"] == "how" and "runs on 192.168.1.58, not this box" in q["ask"] and "ssh:<user@host>" in q["ask"],
+   "the how question for a service on another host says local restarts do not apply", q["ask"])
+r = run("answer", "media-server", "how", "docker:navidrome", expect=64)
+ok(r.returncode == 64 and "runs on 192.168.1.58" in r.stderr,
+   "docker: for a service on another host is refused at answer time (C3)", r.stderr)
+run("answer", "media-server", "how", "ssh:media@192.168.1.58")
 run("answer", "media-server", "how", "script:remediations/restart-media.sh")
 run("answer", "media-server", "host", "severs — that outlet feeds the router too")
 run("answer", "media-server", "consent", "household: it's the living room")
@@ -201,11 +224,16 @@ r = run("fill")
 ok(CFG.read_text() == before, "fill without --apply leaves services.json byte-identical")
 ok((DEPLOY / "services.draft.json").exists(), "a draft is written next to the config")
 ok("kept as" in r.stdout and "WIFI_WEDGED" in r.stdout, "a hand-set ask entry is reported as kept, not changed")
-ok("docker" not in r.stdout, "a superseded answer leaves no trace in the fill")
+ok("ssh-forced-command" not in r.stdout and "SSH_TARGET" not in r.stdout,
+   "a superseded answer leaves no trace in the fill")
+ok("lint:" in r.stdout and "wifi: remediations.WIFI_WEDGED" in r.stdout and "is not a file" in r.stdout,
+   "the draft is linted too: a hand-set entry whose script is missing is reported as advice", r.stdout)
 
 print("== fill --apply: the mappings ==")
 r = run("fill", "--apply")
 ok(len(list(DEPLOY.glob("services.json.backup-*"))) == 1, "a backup of services.json is kept")
+ok("lint:" in r.stdout and r.stdout.index("applied") < r.stdout.index("lint:"),
+   "fill --apply lints the written config (C6)", r.stdout)
 gw = svc("gateway")
 ok(gw["remediations"] == {c: "remediations/templates/restart-systemd-unit.sh" for c in ("PORT_DEAD", "UNIT_INACTIVE", "WEDGED")},
    "class=fix + how=systemd wires every fixable code to the shipped template", gw["remediations"])
@@ -349,6 +377,195 @@ run("next", "--digest", str(digest))
 line = json.loads(digest.read_text().splitlines()[-1])
 ok(line["system"] == "interview" and (":class)" in line["message"] or ":how)" in line["message"]),
    "the digest line carries the question id and text", line)
+
+# ---- apply-time safety checks ------------------------------------------------------------
+
+print("== apply-time safety checks: a wrong auto fix never reaches services.json ==")
+HA = {"HA_URL": "http://192.168.1.35:8123", "HA_TOKEN_FILE": "/etc/ha.env"}
+SAFETY = [
+    # C1: one hand-set auto string, the other codes undecided
+    {"name": "half-wired", "check": "checks/templates/check-systemd-unit.sh",
+     "params": {"CHECK_KEY": "half-wired", "UNIT": "half"},
+     "remediations": {"UNIT_INACTIVE": "remediations/templates/restart-systemd-unit.sh"}},
+    # C2: class fix with a script that does not exist / lives outside remediations/
+    {"name": "c2-missing", "check": "checks/templates/check-http.sh",
+     "params": {"CHECK_KEY": "c2-missing", "HTTP_URL": "http://127.0.0.1:8081/health"}},
+    {"name": "c2-outside", "check": "checks/templates/check-http.sh",
+     "params": {"CHECK_KEY": "c2-outside", "HTTP_URL": "http://127.0.0.1:8082/health"}},
+    # C3: the same restart answer for a service on this box and on another host
+    {"name": "local-web", "check": "checks/templates/check-http.sh",
+     "params": {"CHECK_KEY": "local-web", "HTTP_URL": "http://localhost:8080/health", "HOST_IP": "127.0.0.1"}},
+    {"name": "media-server", "check": "checks/templates/check-http.sh",
+     "params": {"CHECK_KEY": "media-server", "HTTP_URL": "http://192.168.1.58:4533/ping", "HOST_IP": "192.168.1.58"}},
+    # C4: a host actuator through HA on a device without HA params
+    {"name": "nas", "check": "checks/templates/check-tcp-port.sh",
+     "params": {"CHECK_KEY": "nas", "TCP_HOST": "192.168.1.60", "TCP_PORT": "445"}},
+    # C5: an entity the check expects OFF
+    {"name": "heater", "check": "checks/templates/check-ha-entity.sh",
+     "params": dict(HA, CHECK_KEY="heater", ENTITY_ID="switch.heater", EXPECT_STATE="off")},
+    # ssh: a service on another host
+    {"name": "pi-svc", "check": "checks/templates/check-http.sh",
+     "params": {"CHECK_KEY": "pi-svc", "HTTP_URL": "http://192.168.1.70:9000/", "HOST_IP": "192.168.1.70"}},
+    # outlet: a dark-host actuator, HA params present
+    {"name": "tv-box", "check": "checks/templates/check-http.sh",
+     "params": dict(HA, CHECK_KEY="tv-box", HTTP_URL="http://192.168.1.80:8008/", HOST_IP="192.168.1.80")},
+    # a pinned argument on an ask-first script
+    {"name": "arg-box", "check": "checks/templates/check-http.sh",
+     "params": {"CHECK_KEY": "arg-box", "HTTP_URL": "http://127.0.0.1:8083/"}},
+    # a hand-set ask entry whose script is missing: the lint's advice case
+    {"name": "wifi", "check": "checks/check-wifi.sh", "params": {},
+     "remediations": {"WIFI_WEDGED": {"ask": "remediations/wifi-reset.sh"}}},
+]
+write_cfg(SAFETY)
+(DEPLOY / "interview.json").unlink(missing_ok=True)
+ANS = DEPLOY / "interview.json"
+
+
+def set_param(name, **kv):
+    """The admin sets params by hand."""
+    data = cfg()
+    next(x for x in data["services"] if x["name"] == name)["params"].update(kv)
+    CFG.write_text(json.dumps(data, indent=2) + "\n")
+
+
+print("-- C1: an inferred auto class does not auto-wire the remaining codes --")
+plan = {p["device"]: p for p in json.loads(run("plan", "--json").stdout)}
+ok(plan["half-wired"]["open"][:2] == ["class", "how"] and any("inferred" in w for w in plan["half-wired"]["why"]),
+   "a device with one hand-set auto entry is asked its class explicitly, and plan says why", plan.get("half-wired"))
+run("answer", "half-wired", "how", "systemd:half")
+r = run("fill", "--device", "half-wired", "--apply")
+ok(svc("half-wired")["remediations"] == {"UNIT_INACTIVE": "remediations/templates/restart-systemd-unit.sh"}
+   and "! " in r.stdout and "NOT auto-wired" in r.stdout and "inferred" in r.stdout and "nothing to fill" in r.stdout,
+   "how= without an explicit class answer writes no auto entry, and says why", r.stdout)
+run("answer", "half-wired", "class", "fix")
+run("fill", "--device", "half-wired", "--apply")
+ok(svc("half-wired")["remediations"] == {c: "remediations/templates/restart-systemd-unit.sh" for c in ("PORT_DEAD", "UNIT_INACTIVE", "WEDGED")},
+   "once the admin says fix, the remaining codes are auto-wired", svc("half-wired")["remediations"])
+
+print("-- C2: an auto script must exist and sit under remediations/ --")
+run("answer", "c2-missing", "class", "fix")
+run("answer", "c2-missing", "how", "script:remediations/not-there.sh")
+r = run("fill", "--device", "c2-missing", "--apply")
+rem = svc("c2-missing").get("remediations", {})
+ok("SERVICE_DOWN" not in rem and "API_ERROR" not in rem and "is not a file" in r.stdout,
+   "a script that does not exist is skipped, with a note", (rem, r.stdout))
+run("answer", "c2-outside", "class", "fix")
+run("answer", "c2-outside", "how", "script:bin/outside-restart.sh")
+r = run("fill", "--device", "c2-outside", "--apply")
+ok(svc("c2-outside")["remediations"]["SERVICE_DOWN"] == {"ask": "bin/outside-restart.sh"}
+   and "wired ask-first instead" in r.stdout,
+   "an auto script outside remediations/ is downgraded to an ask dict, with a note", r.stdout)
+
+print("-- C3: systemd:/docker: restart THIS box; refused for a service on another host --")
+r = run("answer", "media-server", "how", "systemd:navidrome", expect=64)
+ok(r.returncode == 64 and "runs on 192.168.1.58" in r.stderr and "ssh:<user@host>" in r.stderr,
+   "systemd: for a remote http device is refused at answer time, pointing at ssh:", r.stderr)
+# the fill-time backstop: an answer recorded while the device still looked local
+ans = json.loads(ANS.read_text())
+ans["devices"]["media-server"] = {
+    "class": {"key": "fix", "value": None, "text": "fix", "at": "2026-01-01T00:00:00Z", "question": ""},
+    "how": {"key": "systemd", "value": "navidrome", "text": "systemd:navidrome", "at": "2026-01-01T00:00:00Z", "question": ""}}
+ANS.write_text(json.dumps(ans))
+r = run("fill", "--device", "media-server", "--apply")
+rem = svc("media-server").get("remediations", {})
+ok("SERVICE_DOWN" not in rem and "API_ERROR" not in rem and "restarts something on this box" in r.stdout,
+   "...and fill refuses it again when the answer is already recorded (backstop)", (rem, r.stdout))
+run("answer", "local-web", "class", "fix")
+run("answer", "local-web", "how", "systemd:local-web")
+r = run("fill", "--device", "local-web", "--apply")
+ok(svc("local-web")["remediations"]["SERVICE_DOWN"] == "remediations/templates/restart-systemd-unit.sh"
+   and svc("local-web")["params"]["UNIT"] == "local-web",
+   "the same answer for a loopback device is written", r.stdout)
+
+print("-- C4: a fix whose by-hand params are missing is not written --")
+run("answer", "nas", "class", "ask")
+run("answer", "nas", "how", "none")
+run("answer", "nas", "host", "ha:switch.nas_outlet")
+r = run("fill", "--device", "nas", "--apply")
+rem = svc("nas").get("remediations", {})
+ok("HOST_DOWN" not in rem and rem.get("PORT_CLOSED", 1) is None and "not written until params.HA_URL and params.HA_TOKEN_FILE" in r.stdout
+   and "mode-600 file" in r.stdout,
+   "ha: without HA_URL/HA_TOKEN_FILE in params is not written; the note says what to set", (rem, r.stdout))
+set_param("nas", **HA)
+r = run("fill", "--device", "nas", "--apply")
+ok(svc("nas")["remediations"]["HOST_DOWN"] == {"ask": "remediations/templates/ha-service-call.sh"}
+   and svc("nas")["params"]["HA_ENTITY"] == "switch.nas_outlet" and "HA_URL" not in r.stdout,
+   "once the params are set by hand, the next fill writes it", r.stdout)
+
+print("-- C5: turn_on is the wrong direction for an entity expected OFF --")
+run("answer", "heater", "class", "fix")
+run("answer", "heater", "how", "ha:switch.heater_relay")
+r = run("fill", "--device", "heater", "--apply")
+h = svc("heater")
+ok(h["remediations"]["VALUE_LOW"] == "remediations/templates/ha-service-call.sh"
+   and h["remediations"]["VALUE_CRITICAL"] == "remediations/templates/ha-service-call.sh"
+   and "STATE_MISMATCH" not in h["remediations"] and "wrong direction" in r.stdout and "EXPECT_STATE=off" in r.stdout,
+   "ha: on a device with EXPECT_STATE=off skips STATE_MISMATCH with a note and wires the rest", (h["remediations"], r.stdout))
+
+print("-- ssh: a forced-command key on the other host --")
+run("answer", "pi-svc", "class", "fix")
+r = run("answer", "pi-svc", "how", "ssh:nouser", expect=64)
+ok(r.returncode == 64 and "user@host" in r.stderr, "ssh: wants user@host", r.stderr)
+run("answer", "pi-svc", "how", "ssh:pi@192.168.1.70.")
+r = run("fill", "--device", "pi-svc", "--apply")
+rem = svc("pi-svc").get("remediations", {})
+ok("SERVICE_DOWN" not in rem and "not written until params.SSH_KEY" in r.stdout,
+   "ssh: needs SSH_KEY set by hand first", (rem, r.stdout))
+set_param("pi-svc", SSH_KEY="/etc/cranston/pi-key")
+r = run("fill", "--device", "pi-svc", "--apply")
+p = svc("pi-svc")
+ok(p["remediations"]["SERVICE_DOWN"] == "remediations/templates/ssh-forced-command.sh"
+   and p["remediations"]["API_ERROR"] == "remediations/templates/ssh-forced-command.sh"
+   and p["params"]["SSH_TARGET"] == "pi@192.168.1.70" and p["params"]["REMEDIATION_KEY"] == "pi-svc",
+   "ssh: wires ssh-forced-command.sh with SSH_TARGET (trailing punctuation stripped)", p)
+
+print("-- outlet: cycles power, so ask-first only --")
+run("answer", "tv-box", "class", "fix")
+r = run("answer", "tv-box", "how", "outlet:switch.tv", expect=64)
+ok(r.returncode == 64 and CATALOG["fixes"]["outlet"]["refuse"] in r.stderr,
+   "outlet: for class fix is refused at answer time with the catalogue's reason", r.stderr)
+r = run("answer", "tv-box", "host", "outlet:light.tv", expect=64)
+ok(r.returncode == 64 and "switch.<outlet>" in r.stderr, "outlet: must name a switch.* entity", r.stderr)
+run("answer", "tv-box", "how", "none")
+run("answer", "tv-box", "host", "outlet:switch.tv_outlet.")
+run("answer", "tv-box", "consent", "household")
+r = run("fill", "--device", "tv-box", "--apply")
+tv = svc("tv-box")
+ok(tv["remediations"]["HOST_DOWN"] == {"ask": "remediations/templates/ha-outlet-cycle.sh", "consent": "household"}
+   and tv["params"]["OUTLET_ENTITY"] == "switch.tv_outlet" and tv["params"]["REMEDIATION_KEY"] == "tv-box",
+   "outlet: as the host answer -> an ask dict with OUTLET_ENTITY (trailing punctuation stripped)", tv)
+
+print("-- script:<path> <arg>: a pinned argument, ask-first only --")
+run("answer", "arg-box", "class", "fix")
+r = run("answer", "arg-box", "how", "script:remediations/restart-media.sh outlet-7", expect=64)
+ok(r.returncode == 64 and "pinned argument" in r.stderr, "a pinned arg on an auto-class string is refused", r.stderr)
+run("answer", "arg-box", "class", "ask")
+run("answer", "arg-box", "how", "script:remediations/restart-media.sh because the docker one is slow")
+ok("arg" not in json.loads(ANS.read_text())["devices"]["arg-box"]["how"],
+   "a word of explanation after the path is not mistaken for a pinned arg")
+r = run("answer", "arg-box", "how", "script:remediations/restart-media.sh outlet-7 — the TV strip")
+ok("arg=outlet-7" in r.stdout and json.loads(ANS.read_text())["devices"]["arg-box"]["how"]["arg"] == "outlet-7",
+   "the arg is recorded and echoed", r.stdout)
+r = run("fill", "--device", "arg-box", "--apply")
+ok(svc("arg-box")["remediations"]["SERVICE_DOWN"] == {"ask": "remediations/restart-media.sh", "arg": "outlet-7"},
+   "script:<path> <arg> pins the argument on the ask-first entry", svc("arg-box")["remediations"])
+
+print("-- C6: the lint after --apply --")
+ok("lint:" in r.stdout and "wifi: remediations.WIFI_WEDGED" in r.stdout and "is not a file" in r.stdout
+   and r.returncode == 0,
+   "a hand-set entry whose script is missing is reported as advice, exit 0", r.stdout)
+data = cfg()
+next(x for x in data["services"] if x["name"] == "wifi")["remediations"]["WIFI_DOWN"] = \
+    "remediations/templates/ha-outlet-cycle.sh"          # a hand miswire of the ask-first-only template
+next(x for x in data["services"] if x["name"] == "wifi")["remediations"]["WIFI_ODD"] = \
+    {"ask": "remediations/restart-media.sh", "arg": "-rf"}
+CFG.write_text(json.dumps(data, indent=2) + "\n")
+run("answer", "arg-box", "drill", "ok")
+r = run("fill", "--device", "arg-box", "--apply")
+ok("WIFI_DOWN" in r.stdout and "ask-first only" in r.stdout, "the lint flags an auto string on the ask-first-only outlet template", r.stdout)
+ok("WIFI_ODD" in r.stdout and "pinned arg '-rf'" in r.stdout, "the lint flags a malformed pinned arg", r.stdout)
+ok(r.returncode == 0, "...as advice: hand-set problems do not fail the fill")
+ok("Traceback" not in r.stdout + r.stderr, "no tracebacks")
 
 shutil.rmtree(tmp, ignore_errors=True)
 print()
