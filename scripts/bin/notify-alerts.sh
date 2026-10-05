@@ -46,6 +46,9 @@
 #                                 are folded into the page message and counted in
 #                                 its header, so nothing is silently dropped.
 #   SELFHEAL_LOG_FILE             optional - append one line per real action
+#   SELFHEAL_NOW                  TEST-ONLY: ISO UTC (%Y-%m-%dT%H:%M:%SZ) stand-in
+#                                 for 'now' in the sent window, for simulated-clock
+#                                 harnesses. Unset (production) = real time.
 #
 # Locking is python fcntl on <file>.lock - the same lock send-alert.sh takes.
 # The lock is NOT held while the sender runs: the engine's flush would queue
@@ -87,7 +90,11 @@ try:
     window = float(window)
 except ValueError:
     window = 30.0
-now = datetime.now(timezone.utc)
+# SELFHEAL_NOW (test-only, like the engine's SELFHEAL_GRACE_MINUTES): lets a
+# simulated-clock harness drive the sent window; unset = real time.
+_t = os.environ.get("SELFHEAL_NOW")
+now = (datetime.strptime(_t, FMT).replace(tzinfo=timezone.utc)
+       if _t else datetime.now(timezone.utc))
 logs = []
 
 
@@ -230,7 +237,8 @@ from datetime import datetime, timezone
 
 path = sys.argv[1]
 sent_path = path + ".sent.json"
-now = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+now = os.environ.get("SELFHEAL_NOW") \
+      or datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")  # test-only override
 delivered = []
 for lines_path in sys.argv[2:]:
     with open(lines_path) as f:

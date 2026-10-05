@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
-"""fake-service.py <kind> <port> - a stand-in home service on loopback.
+"""fake-service.py <kind> <port> [path] - a stand-in home service on loopback.
 
-kind=http: answers GET /ping with 200 (anything else 404).
+kind=http: answers GET <path> with 200 (default /ping; anything else 404).
 kind=tcp:  accepts and immediately closes TCP connections.
 """
 import socket
@@ -9,11 +9,12 @@ import sys
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 kind, port = sys.argv[1], int(sys.argv[2])
+ok_path = sys.argv[3] if len(sys.argv) > 3 else "/ping"
 
 
 class Ping(BaseHTTPRequestHandler):
     def do_GET(self):
-        self.send_response(200 if self.path == "/ping" else 404)
+        self.send_response(200 if self.path == ok_path else 404)
         self.end_headers()
         self.wfile.write(b"ok\n")
 

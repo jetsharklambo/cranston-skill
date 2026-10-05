@@ -256,6 +256,30 @@ assert "default sender against HTTP 500 -> exit 1" 1 - -- \
 [ "$(alerts_json)" = '["🚨 default sender, API down"]' ] && ok "queue kept when the Bot API fails" || bad "queue after API 500: $(alerts_json)"
 echo ok > "$TGMODE"
 
+echo "== SELFHEAL_NOW (test-only sim-clock for the sent window) =="
+# set: the window is stamped with the override and a repeat 31 sim-minutes
+# later is NOT dropped; unset: behavior unchanged (real clock, repeat dropped).
+reset_na
+SELFHEAL_ALERT_FILE="$AF" bash "$BIN/send-alert.sh" "🚨 sim clock line"
+assert "drain at sim T0" 0 - -- "${NA[@]}" SELFHEAL_NOW=2030-05-01T08:00:00Z bash "$BIN/notify-alerts.sh"
+python3 - "$AF.sent.json" <<'PY'
+import json, sys
+sent = json.load(open(sys.argv[1]))
+assert sent.get("🚨 sim clock line") == "2030-05-01T08:00:00Z", sent
+PY
+[ $? -eq 0 ] && ok "sent window stamped with the simulated time" || bad "sent window stamp"
+SELFHEAL_ALERT_FILE="$AF" bash "$BIN/send-alert.sh" "🚨 sim clock line"
+assert "repeat 31 sim-min later is delivered (window moved with sim time)" 0 - -- \
+    "${NA[@]}" SELFHEAL_NOW=2030-05-01T08:31:00Z bash "$BIN/notify-alerts.sh"
+[ "$(sends)" = "2" ] && ok "two real sends across the sim window" || bad "sim-window sends: $(sends)"
+reset_na
+SELFHEAL_ALERT_FILE="$AF" bash "$BIN/send-alert.sh" "🚨 real clock line"
+assert "unset: first drain delivers" 0 - -- "${NA[@]}" bash "$BIN/notify-alerts.sh"
+SELFHEAL_ALERT_FILE="$AF" bash "$BIN/send-alert.sh" "🚨 real clock line"
+assert "unset: immediate repeat is window-dropped (real clock unchanged)" 0 - -- \
+    "${NA[@]}" bash "$BIN/notify-alerts.sh"
+[ "$(sends)" = "1" ] && ok "unset behavior unchanged: one send" || bad "real-clock sends: $(sends)"
+
 echo "== announce routing (channel queue + drainer) =="
 ann_enqueue() { SELFHEAL_ALERT_FILE="$AF" SELFHEAL_ALERT_CHANNEL=announce bash "$BIN/send-alert.sh" "$@"; }
 chats() { tr '\n' ' ' < "$SENTLOG.chat" 2>/dev/null | sed 's/ $//'; }
