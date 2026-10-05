@@ -52,10 +52,19 @@ fmode() { stat -c '%a' "$1" 2>/dev/null || stat -f '%Lp' "$1" 2>/dev/null; }
 
 # The three cron lines, exactly the shape SKILL.md's Install step 5 shows,
 # with this deployment's paths substituted. Every line sources the env file
-# first (cron starts from an empty environment).
+# first (cron starts from an empty environment). flock(1) does not exist on
+# macOS: when it is missing the engine line drops the flock prefix - the
+# engine's own non-blocking state lock already makes an overlapping cycle
+# exit instead of stacking, so the belt is Linux-only.
+FLOCK_PREFIX="flock -n /tmp/cranston.cronlock "
+if ! command -v flock >/dev/null 2>&1; then
+    FLOCK_PREFIX=""
+    echo "install: note - no flock(1) on this platform (macOS?); the engine cron" \
+         "line runs without it. The engine's own lock prevents overlapping cycles."
+fi
 cron_lines() {
     printf '%s\n' \
-        "*/2 * * * * . $ENV_FILE; flock -n /tmp/cranston.cronlock python3 $DEPLOY/engine/selfheal.py >> /var/log/cranston.log 2>&1" \
+        "*/2 * * * * . $ENV_FILE; ${FLOCK_PREFIX}python3 $DEPLOY/engine/selfheal.py >> /var/log/cranston.log 2>&1" \
         "* * * * *   . $ENV_FILE; $DEPLOY/bin/notify-alerts.sh >> /var/log/cranston.log 2>&1" \
         "25 5 * * *  . $ENV_FILE; SELFHEAL_DIGEST_FILE=$DEPLOY/state/digest.jsonl SELFHEAL_NOTIFY_CMD=$DEPLOY/bin/send-telegram.sh $DEPLOY/bin/flush-digest.sh >> /var/log/cranston.log 2>&1"
 }

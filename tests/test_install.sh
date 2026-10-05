@@ -48,6 +48,10 @@ case "${1:-}" in
 esac
 EOF
 chmod +x "$STUBDIR/crontab"
+# stub flock so the printed engine line is deterministic cross-platform
+# (macOS has no flock(1); install.sh drops the prefix when it's absent - the
+# fallback branch is asserted separately below)
+printf '#!/bin/bash\nexit 0\n' > "$STUBDIR/flock"; chmod +x "$STUBDIR/flock"
 
 # run_install [env overrides...] -- [flags...]: output in $OUT, rc in $RC
 OUT=""; RC=0
@@ -87,6 +91,21 @@ has "$DP/bin/notify-alerts.sh" && ok "notify-alerts.sh cron line printed" || bad
 has "SELFHEAL_DIGEST_FILE=$DP/state/digest.jsonl" && has "SELFHEAL_NOTIFY_CMD=$DP/bin/send-telegram.sh" \
     && has "$DP/bin/flush-digest.sh" && ok "digest cron line carries both env vars" || bad "digest line ($OUT)"
 [ ! -s "$CRONTAB_LOG" ] && ok "crontab never invoked without --apply-cron" || bad "crontab touched: $(cat "$CRONTAB_LOG")"
+
+# the no-flock fallback (macOS has no flock(1)): run with a stub dir that
+# carries ONLY crontab, so the platform decides - asserted where flock is
+# genuinely absent, skipped (with the flock branch covered above) elsewhere
+STUBDIR2="$T/stubs-noflock"; mkdir -p "$STUBDIR2"
+cp "$STUBDIR/crontab" "$STUBDIR2/crontab"
+if env PATH="$STUBDIR2:$PATH" bash -c 'command -v flock' >/dev/null 2>&1; then
+    ok "flock present on this platform - fallback branch exercised on macOS runs (skip)"
+else
+    OUT2=$(env PATH="$STUBDIR2:$PATH" bash "$INSTALL" --deploy "$T/dep2" --env-file "$T/env2.env" 2>&1)
+    echo "$OUT2" | grep -q "no flock(1)" \
+        && ok "installer notes the missing flock" || bad "no-flock note ($OUT2)"
+    echo "$OUT2" | grep "engine/selfheal.py" | grep -qv "flock" \
+        && ok "engine cron line printed without the flock prefix" || bad "no-flock engine line"
+fi
 
 echo "== 3. idempotence: config/env/state kept, code replace-copied =="
 # A valid-JSON admin edit (the engine quarantines corrupt configs on its own,

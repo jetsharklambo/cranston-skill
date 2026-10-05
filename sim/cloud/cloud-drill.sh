@@ -337,7 +337,9 @@ def run(argv):
     return r.returncode
 
 
-events = [json.loads(l) for l in open(scenario) if l.strip()]
+# skip '#' comment lines and the {"meta": ...} header, like soak.load_scenario
+events = [e for l in open(scenario) if l.strip() and not l.lstrip().startswith("#")
+          for e in [json.loads(l)] if not e.get("meta")]
 for e in events:
     m, s = e["t"].lstrip("+").split(":")
     due = int(m) * 60 + int(s)

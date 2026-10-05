@@ -183,6 +183,11 @@ steps:
    25 5 * * *  . /etc/cranston.env; SELFHEAL_DIGEST_FILE=/opt/cranston/state/digest.jsonl SELFHEAL_NOTIFY_CMD=/opt/cranston/bin/send-telegram.sh /opt/cranston/bin/flush-digest.sh >> /var/log/cranston.log 2>&1
    ```
 
+   macOS has no `flock(1)`: drop the `flock -n /tmp/cranston.cronlock` prefix
+   there (the installer does this automatically) — the engine's own
+   non-blocking state lock already makes an overlapping cycle exit instead
+   of stacking.
+
 ### Onboard a home (the methodology)
 
 A hand-written `services.json` is the default: the Install procedure above
