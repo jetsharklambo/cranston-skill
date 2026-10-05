@@ -85,12 +85,16 @@ for key, fix in CATALOG["fixes"].items():
        f"fix '{key}': has an option text and names the questions that accept it")
 ok(CATALOG["fixes"]["outlet"]["classes"] == ["ask"], "the outlet cycle is ask-first only in the catalog")
 
-print("== catalog questions cite real interview.md questions ==")
+print("== catalog questions cite real interview.md / discovery.md questions ==")
 interview_md = (REPO / "authoring" / "references" / "interview.md").read_text()
+discovery_md = (REPO / "authoring" / "references" / "discovery.md").read_text()
 for kind, q in CATALOG["questions"].items():
     for u in q["u"].split():
-        ok(re.search(rf"^## {u}\.", interview_md, re.M) is not None, f"{kind} cites {u} (exists in interview.md)")
+        src, where = (discovery_md, "discovery.md") if u.startswith("D") else (interview_md, "interview.md")
+        ok(re.search(rf"^## {u}\.", src, re.M) is not None, f"{kind} cites {u} (exists in {where})")
 ok("onboard/interview.py" in interview_md, "interview.md documents the tool")
+ok(all(CATALOG["kinds"][k] in CATALOG["templates"] for k in CATALOG["kinds"]), "every add kind maps to a catalog template")
+ok(all("setup" in t for t in CATALOG["templates"].values()), "every template has a setup spec")
 
 # ---- a throwaway deployment ----------------------------------------------------------
 
@@ -156,7 +160,8 @@ HANDWRITTEN = [
      "remediations": {"WIFI_WEDGED": {"ask": "remediations/wifi-reset.sh"}}},
     {"name": "decided", "check": "checks/templates/check-dns.sh",
      "params": {"CHECK_KEY": "decided", "RESOLVER_IP": "192.168.1.35"},
-     "remediations": {"DNS_DOWN": None, "UPSTREAM_DOWN": None}},
+     "remediations": {"DNS_DOWN": None, "UPSTREAM_DOWN": None},
+     "realert_minutes_by_code": {"UPSTREAM_DOWN": 1440}},
 ]
 write_cfg(HANDWRITTEN)
 
@@ -201,6 +206,7 @@ run("answer", "media-server", "how", "ssh:media@192.168.1.58")
 run("answer", "media-server", "how", "script:remediations/restart-media.sh")
 run("answer", "media-server", "host", "severs — that outlet feeds the router too")
 run("answer", "media-server", "consent", "household: it's the living room")
+run("answer", "media-server", "announce", "Heads-up: the media box is restarting, the TV will blip for a minute.")
 run("answer", "media-server", "drill", "ok")
 run("answer", "media-server", "nag", "daily")
 run("answer", "nas", "class", "tell")
@@ -240,7 +246,8 @@ ok(gw["remediations"] == {c: "remediations/templates/restart-systemd-unit.sh" fo
 ok(gw["params"]["REMEDIATION_KEY"] == "gateway" and gw["params"]["UNIT"] == "openclaw-gateway",
    "params the template needs are added; the existing UNIT is reused")
 ms = svc("media-server")
-ok(ms["remediations"]["SERVICE_DOWN"] == {"ask": "remediations/restart-media.sh", "consent": "household"},
+ok(ms["remediations"]["SERVICE_DOWN"] == {"ask": "remediations/restart-media.sh", "consent": "household",
+                                          "announce": "Heads-up: the media box is restarting, the TV will blip for a minute."},
    "class=ask wires an ask-first entry carrying the consent scope", ms["remediations"])
 ok(ms["remediations"]["API_ERROR"] == ms["remediations"]["SERVICE_DOWN"], "all fixable codes get the same fix")
 ok(ms["remediations"]["AUTH_FAILED"] is None, "an unfixable layer becomes tell-only (null)")
@@ -566,6 +573,95 @@ ok("WIFI_DOWN" in r.stdout and "ask-first only" in r.stdout, "the lint flags an 
 ok("WIFI_ODD" in r.stdout and "pinned arg '-rf'" in r.stdout, "the lint flags a malformed pinned arg", r.stdout)
 ok(r.returncode == 0, "...as advice: hand-set problems do not fail the fill")
 ok("Traceback" not in r.stdout + r.stderr, "no tracebacks")
+
+print("== add: devices enter the config through the interview alone ==")
+write_cfg([])                                    # a populated home, an empty config
+(DEPLOY / "interview.json").unlink(missing_ok=True)
+(DEPLOY / "remediations" / "lab-restart.sh").write_text("#!/bin/bash\nexit 0\n")
+ok(json.loads(run("plan", "--json").stdout) == [], "nothing to ask on an empty config")
+ok(run("add", "bad name", "tcp", expect=64).returncode == 64, "a bad service name is refused")
+ok(run("add", "nas", "mainframe", expect=64).returncode == 64, "an unknown kind is refused")
+r = run("add", "nas", "tcp")
+ok("staged nas" in r.stdout and "[nas:setup]" in r.stdout and "TCP_HOST" in r.stdout and "TCP_PORT" in r.stdout,
+   "add stages the device and asks its setup question naming the required params")
+ok(run("add", "nas", "tcp", expect=2).returncode == 2, "adding a staged name twice is refused")
+plan = json.loads(run("plan", "--json").stdout)
+ok(plan and plan[0]["device"] == "nas" and plan[0]["open"] == ["setup"]
+   and any("newly added" in w for w in plan[0]["why"]), "a staged device shows in plan with only setup open", plan)
+ok(run("answer", "nas", "setup", "TCP_HOST=192.168.1.60 CAP_MAX=3", expect=64).returncode == 64,
+   "setup refuses a key the check does not document")
+ok(run("answer", "nas", "setup", "SELFHEAL_ROOT=/x", expect=64).returncode == 64, "setup refuses an engine-owned key")
+r = run("answer", "nas", "setup", "TCP_HOST=192.168.1.60 it's the NAS")
+ok("still needed for nas: TCP_PORT" in r.stdout, "a partial setup says what is still needed")
+run("answer", "nas", "setup", "TCP_HOST=192.168.1.60 TCP_PORT=445")
+q = json.loads(run("next", "--device", "nas", "--json").stdout)
+ok(q["kind"] == "extras" and "TCP_TIMEOUT" in q["ask"], "extras comes next, listing the optional params")
+r = run("answer", "nas", "extras", "CAP_MAX=3 TCP_TIMEOUT=5")
+ok("note: CAP_MAX" in r.stdout, "an undocumented extras key is kept with a note")
+q = json.loads(run("next", "--device", "nas", "--json").stdout)
+ok(q["kind"] == "class" and "192.168.1.60:445" in q["ask"], "the class question uses the setup answers as its nouns")
+run("answer", "nas", "class", "ask")
+run("answer", "nas", "how", "script:remediations/lab-restart.sh nas")
+run("answer", "nas", "host", "none")
+run("answer", "nas", "consent", "household — everyone's photos")
+q = json.loads(run("next", "--device", "nas", "--json").stdout)
+ok(q["kind"] == "announce", "household consent on an ask-first fix asks for the announcement")
+ok(run("answer", "nas", "announce", "🚨 NAS restart PORT_CLOSED", expect=64).returncode == 64,
+   "an alert-shaped announcement is refused")
+ok(run("answer", "nas", "announce", "Reply 'heal nas' to approve", expect=64).returncode == 64,
+   "mechanics in an announcement are refused")
+run("answer", "nas", "announce", "Heads-up: the NAS is restarting, photos will blip for a minute.")
+run("answer", "nas", "drill", "ok")
+run("add", "pi-dns", "dns")
+run("answer", "pi-dns", "setup", "RESOLVER_IP=192.168.1.2")
+run("answer", "pi-dns", "extras", "none")
+run("answer", "pi-dns", "class", "fix")
+run("answer", "pi-dns", "how", "script:remediations/lab-restart.sh")
+run("answer", "pi-dns", "drill", "freely")
+q = json.loads(run("next", "--device", "pi-dns", "--json").stdout)
+ok(q["kind"] == "nag" and "UPSTREAM_DOWN" in q["ask"], "the WAN code gets a nag question")
+run("answer", "pi-dns", "nag", "digest")
+run("add", "root-disk", "disk")
+run("answer", "root-disk", "setup", "MOUNT_PATH=/")
+run("answer", "root-disk", "extras", "none")
+q = json.loads(run("next", "--device", "root-disk", "--json").stdout)
+ok(q["kind"] == "local", "a disk device is asked whether it is on this box")
+run("answer", "root-disk", "local", "yes")
+run("answer", "root-disk", "nag", "digest")
+ok("(staged - not in services.json yet)" in run("status").stdout, "status marks staged devices")
+r = run("fill")
+ok(len(cfg()["services"]) == 0 and "+ service nas" in r.stdout, "a draft fill writes nothing to services.json")
+r = run("fill", "--apply")
+services = {s["name"]: s for s in cfg()["services"]}
+ok(set(services) == {"nas", "pi-dns", "root-disk"}, "apply writes the three added services", sorted(services))
+nas = services["nas"]
+ok(nas["check"] == "checks/templates/check-tcp-port.sh" and nas["params"]["CHECK_KEY"] == "nas"
+   and nas["params"]["TCP_PORT"] == "445" and nas["params"]["CAP_MAX"] == "3"
+   and nas["params"]["REMEDIATION_KEY"] == "nas", "the service carries CHECK_KEY, setup, extras and fix params", nas["params"])
+ok(nas["remediations"]["PORT_CLOSED"] == {"ask": "remediations/lab-restart.sh", "arg": "nas", "consent": "household",
+                                          "announce": "Heads-up: the NAS is restarting, photos will blip for a minute."},
+   "the ask-first entry carries consent and the announcement", nas["remediations"])
+ok(nas["remediations"]["HOST_DOWN"] is None and nas["consent_notes"] == "everyone's photos", "host=none and consent_notes landed")
+ok(nas["_interview"]["check"]["why"] == "add tcp" and nas["_interview"]["params.TCP_PORT"]["why"] == "setup",
+   "provenance records the add and the setup answers")
+pi = services["pi-dns"]
+ok(pi["remediations"] == {"DNS_DOWN": "remediations/lab-restart.sh", "UPSTREAM_DOWN": None}
+   and pi["notify_by_code"] == {"UPSTREAM_DOWN": "digest"} and pi["realert_minutes_by_code"] == {"UPSTREAM_DOWN": 1440},
+   "the WAN code is tell-only, routed to the digest, nagged daily", pi)
+ok(services["root-disk"].get("local") is True, "local=yes -> local: true")
+ok(json.loads((DEPLOY / "interview.json").read_text()).get("added") == {}, "nothing stays staged after apply")
+ok(json.loads(run("plan", "--json").stdout) == [], "nothing left to ask")
+ok(run("add", "nas", "tcp", expect=2).returncode == 2, "adding a name already in the config is refused")
+write_cfg([{"name": "stub", "check": "checks/templates/check-dns.sh", "params": {"CHECK_KEY": "stub"}}])
+(DEPLOY / "interview.json").unlink(missing_ok=True)
+plan = json.loads(run("plan", "--json").stdout)
+ok(plan and plan[0]["open"] == ["setup"], "a hand-written entry missing RESOLVER_IP is asked for it first", plan)
+run("answer", "stub", "setup", "RESOLVER_IP=10.0.0.53")
+run("answer", "stub", "class", "tell")
+run("answer", "stub", "nag", "hourly")
+r = run("fill", "--apply")
+ok(svc("stub")["params"]["RESOLVER_IP"] == "10.0.0.53", "setup fills the missing param on a hand-written entry")
+ok("Traceback" not in r.stdout + r.stderr, "no tracebacks in the add flow")
 
 shutil.rmtree(tmp, ignore_errors=True)
 print()

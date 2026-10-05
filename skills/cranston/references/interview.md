@@ -16,7 +16,10 @@ unasked.
 - **Per device, only the gaps** (the default when the admin *does* ask).
   `scripts/onboard/interview.py` reads the config, ranks the devices that
   still have an open decision, and asks one device-shaped question at a
-  time. Re-interview one device, never the whole house. Next section.
+  time. Re-interview one device, never the whole house. A device not yet in
+  the config enters the same way: `add <name> <kind>` stages it, the setup
+  question collects what its check cannot run without, and `fill --apply`
+  is what writes it. Next section.
 - **One onboarding conversation.** All 17 in a sitting, ~30 minutes, for an
   admin who wants the whole picture mapped before writing any config. The
   house-level questions (U4, U6, U7, U11, U12, U14–U17) only exist here.
@@ -40,13 +43,17 @@ is safe while it waits.
 
 | Kind | Asks | Applies when | Answer grammar | Maps to |
 |---|---|---|---|---|
+| `setup` | D6 | a device's check is missing a param it cannot run without (every device staged by `add`; a hand-written stub too) | `KEY=value ...` (only the keys the check documents) | `params.<KEY>`; `CHECK_KEY` is set to the name |
+| `extras` | D6 | a staged device, once | `none` / `KEY=value ...` (the check's optional params; an undocumented key is kept with a note — remediation params live here) | `params.<KEY>` |
+| `local` | D6 | a staged device whose check runs on this box (disk, systemd, host-power, lan-inventory) | `yes` / `no` | `local: true` — keeps being checked while the LAN is down |
 | `retire` | U13 | the live state shows the device failing ≥ 7 days | `retire` / `keep` | `enabled: false`; the retirement list |
 | `class` | U1 | a fixable code (service/state layer) has no decision | `fix` / `ask` / `tell` | `remediations.<code>`; unfixable layers → `null` |
 | `how` | U1 | class is fix/ask and no fix is chosen | `systemd:<unit>` / `docker:<container>` (ask-first only) / `ha:<switch>` (turn_on only) / `ssh:<user@host>` (a forced-command key on that host) / `outlet:<switch>` (power-cycle; ask-first only) / `script:<path> [<arg>]` (an ask-first entry may pin one argument) / `none` | the fix on every fixable code, plus the params its template needs |
 | `host` | U1, U2 | the check can report a host-layer code and a host address is in params | `outlet:<switch>` (cycle its outlet: off, wait, on — the natural answer) / `ha:<switch>` (turn it ON) / `ssh:<user@host>` / `script:<path> [<arg>]` (all ask-first) / `none` / `severs` | an ask-first entry, `null`, or a recorded omission (on-demand class; never-touch list) |
 | `consent` | U10 | an ask-first entry lacks `consent` | `admin` / `named:<person>` / `household` | `consent` on each ask-first entry, `consent_notes` |
+| `announce` | U10 | an ask-first entry's consent reaches beyond the admin and it has no announcement | the household's heads-up, verbatim (no alert headers, codes or 'reply heal' — refused otherwise) | `announce` on each such entry; the drainer sends it to the announce chat before the fix runs |
 | `drill` | U3 | the device has a fix | `freely` / `ok` / `never` | the doctrine only |
-| `nag` | U5 | a chronic (degraded) code has no `realert_minutes_by_code` | `daily` / `hourly` / `digest` | 1440 / 60; `notify_by_code: digest` |
+| `nag` | U5 | a chronic (degraded) or upstream (WAN) code has no `realert_minutes_by_code` | `daily` / `hourly` / `digest` | 1440 / 60; `notify_by_code: digest` |
 
 Ranking (`plan`): failing or awaiting approval right now › failing for a
 week › a shipped remediation fits the device type › no fix/ask/tell decision

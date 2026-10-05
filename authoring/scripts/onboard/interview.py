@@ -14,6 +14,10 @@ config fields and shows the diff. Nothing touches services.json without
 only revise fills it made itself (tracked in the service's `_interview` map),
 and only for a device named with `--device D --overwrite`.
 
+  add NAME KIND                stage a new device (kind: http, tcp, dns, systemd,
+                               disk, cert, ha-entity, host-power, lan-inventory);
+                               its params come from the setup/extras questions and
+                               nothing is written until `fill --apply`
   plan                         rank the devices that still need a decision, and why
   next [--device D] [--digest FILE]
                                the next question (one device, one kind); --digest
@@ -63,15 +67,29 @@ BASE = Path(__file__).resolve().parent          # onboard/
 ROOT = BASE.parent                              # install root
 CATALOG = json.loads((BASE / "catalog.json").read_text())
 FIXABLE = set(CATALOG["fixable_layers"])
+# codes that nag at a cadence: degraded/chronic ones, and the WAN's (nothing
+# here fixes an ISP outage, but hourly 🚨 pages about it get the admin muted)
+NAG_LAYERS = set(CATALOG.get("nag_layers", ["chronic"]))
 FIXES = CATALOG["fixes"]
+ADD_KINDS = CATALOG.get("kinds", {})
 
-# ask order within one device: a retirement question may make the rest moot
-KINDS = ["retire", "class", "how", "host", "consent", "drill", "nag"]
+# ask order within one device: setup first (nothing else can be asked about a
+# device whose target is unknown), then a retirement question may make the
+# rest moot
+KINDS = ["setup", "extras", "local", "retire", "class", "how", "host", "consent",
+         "announce", "drill", "nag"]
 
 # The one argument a remediation may take. Keep the text identical to
 # engine/selfheal.py's ARG_RE: a pinned "arg" the engine would refuse is a
 # config bug the interview must never write.
 ARG_RE = r"[A-Za-z0-9][A-Za-z0-9._@:-]{0,63}"
+# a service name / finding key root, and a params key (the engine's shapes)
+NAME_RE = r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}"
+PARAM_KEY_RE = r"[A-Z][A-Z0-9_]{0,63}"
+# params keys the engine refuses a service for - keep identical to selfheal.py
+RESERVED_PARAM_RE = r"^(SELFHEAL_|GATE_|LD_|BASH_|PYTHON|SHELLOPTS$|PATH$|ENV$|CDPATH$|IFS$|HOME$)"
+# an announcement is for the household: no alert headers, no codes, no mechanics
+ANNOUNCE_FORBIDDEN = ("🚨", "⚠️", "🔧", "✅", "reply 'heal", "reply heal")
 
 
 def _kinds(question):
@@ -87,7 +105,10 @@ GRAMMAR = {
     "consent": r"^(?:(named):(\S+)|(admin|household)\b)",
     "drill":   r"^(freely|ok|never)\b",
     "nag":     r"^(daily|hourly|digest)\b",
+    "local":   r"^(yes|no)\b",
 }
+# setup / extras take KEY=value pairs, announce takes free text: parsed by hand
+PAIR_KINDS = ("setup", "extras")
 # what an admin's sentence leaves stuck to a value: "ha:switch.x." -> switch.x
 VALUE_STRIP_LEAD, VALUE_STRIP_TAIL = "'\"([{", ".,;:!?)]}'\""
 # a pinned arg must be the last word, or set off from the admin's words by one of these
@@ -211,6 +232,25 @@ def has_param(params, need):
     return need in params or any(alt in params for alt in ALT_PARAMS.get(need, ()))
 
 
+def parse_pairs(text, allow_none=False):
+    """KEY=value tokens, whitespace-separated, the admin's words allowed after
+    them ("RESOLVER_IP=192.168.1.2 it's the Pi in the hall"). Returns a dict
+    ({} for an allowed 'none'), or None when the text starts with no pair."""
+    t = text.strip()
+    if allow_none and re.match(r"^none\b", t, re.IGNORECASE):
+        return {}
+    pairs = {}
+    for tok in t.split():
+        if "=" not in tok:
+            break                       # the rest is prose
+        k, v = tok.split("=", 1)
+        v = clean_value(v)
+        if not re.fullmatch(PARAM_KEY_RE, k) or not v:
+            return None
+        pairs[k] = v
+    return pairs or None
+
+
 def fix_params(kind, value):
     return {k: v.format(value=value) for k, v in FIXES[kind]["params"].items()}
 
@@ -233,14 +273,38 @@ class Deployment:
         self.state = load_json(state_dir / "state.json", {"keys": {}}).get("keys", {})
         self.pending = load_json(state_dir / "pending-approvals.json", {})
 
+    def staged(self):
+        """Devices added through `add` and not yet written by `fill --apply`."""
+        return self.answers.get("added", {})
+
+    def staged_service(self, name):
+        """A staged device as a virtual service: its check from the `add`
+        record, its params from the setup/extras answers (CHECK_KEY is the
+        name), `local` from the local answer. The usual questions run on it
+        exactly as on a hand-written entry; `fill` is what writes it."""
+        rec = self.staged()[name]
+        ans = self.device_answers(name)
+        params = {"CHECK_KEY": name}
+        for kind in PAIR_KINDS:
+            if ans.get(kind) and isinstance(ans[kind].get("value"), dict):
+                params.update(ans[kind]["value"])
+        svc = {"name": name, "check": rec["check"], "params": params, "_staged": True}
+        if ans.get("local", {}).get("key") == "yes":
+            svc["local"] = True
+        return svc
+
     def services(self):
-        return [s for s in self.config.get("services", []) if s.get("enabled", True)]
+        real = [s for s in self.config.get("services", []) if s.get("enabled", True)]
+        names = {s.get("name") for s in self.config.get("services", [])}
+        return real + [self.staged_service(n) for n in self.staged() if n not in names]
 
     def service(self, name):
         for s in self.config.get("services", []):
             if s.get("name") == name:
                 return s
-        die(f"no service named '{name}' in {self.config_path}")
+        if name in self.staged():
+            return self.staged_service(name)
+        die(f"no service named '{name}' in {self.config_path} (add one with `add {name} <kind>`)")
 
     def device_answers(self, name):
         return self.answers["devices"].get(name, {})
@@ -265,6 +329,8 @@ class Device:
         self.prov = svc.get("_interview") or {}
         self.tpl = CATALOG["templates"].get(svc.get("check", ""))
         self.answers = dep.device_answers(self.name)
+        # staged: added through the interview, not yet in services.json
+        self.staged = bool(svc.get("_staged"))
         # redo: this device is being re-interviewed (`reask`, or `fill --device
         # D --overwrite`). Its interview-made fills count as open again; fields
         # the admin set by hand never do.
@@ -417,6 +483,59 @@ class Device:
         codes to auto on its strength - the admin says `fix` for the device."""
         return self.effective_class() == "fix" and not self.ans("class")
 
+    # -- setup: the params the check cannot run without ------------------------
+
+    def setup_spec(self):
+        return (self.tpl or {}).get("setup")
+
+    def missing_setup(self):
+        """Required params nobody has given yet (a required_any group counts
+        as one item, satisfied by any of its alternatives)."""
+        spec = self.setup_spec()
+        if not spec:
+            return []
+        missing = [k for k in spec.get("required", []) if k not in self.params]
+        anys = spec.get("required_any", [])
+        if anys and not any(all(k in self.params for k in g) for g in anys):
+            missing.append(" or ".join("+".join(g) for g in anys))
+        return missing
+
+    def known_params(self):
+        spec = self.setup_spec() or {}
+        return (set(spec.get("required", [])) | {k for g in spec.get("required_any", []) for k in g}
+                | set(spec.get("optional", [])))
+
+    def kind_name(self):
+        return next((k for k, t in ADD_KINDS.items() if t == self.svc.get("check")),
+                    self.svc.get("check", "?"))
+
+    # -- consent + announce --------------------------------------------------------
+
+    def consent_scope(self):
+        """The consent in force for this device's ask-first entries: the
+        answer, else a hand-set one, else None."""
+        if self.ans("consent"):
+            c, who = self.ans("consent"), self.ans_value("consent")
+            return f"named:{who}" if c == "named" else c
+        for v in self.rem.values():
+            if isinstance(v, dict) and v.get("consent"):
+                return v["consent"]
+        return None
+
+    def needs_announce(self):
+        """An ask-first entry - present, or about to be written - whose consent
+        reaches beyond the admin and that has no announcement text yet. The
+        engine sends `announce` to the household chat before such a fix runs;
+        without it the household hears nothing."""
+        scope = self.consent_scope()
+        if not scope or scope == "admin":
+            return False
+        for v in self.rem.values():
+            if isinstance(v, dict) and "ask" in v and not v.get("announce"):
+                return True
+        return ((self.effective_class() == "ask" and self.ans("how") not in (None, "none"))
+                or self.ans("host") in FIXES)
+
     def _live(self):
         """What the engine's state says right now: failing keys, pending asks,
         and when the root key's current incident began (`since`).
@@ -445,6 +564,12 @@ class Device:
     # -- which questions apply, and which are still open ---------------------
 
     def applies(self, kind):
+        if kind == "setup":
+            return bool(self.setup_spec())
+        if kind == "extras":
+            return self.staged and bool(self.setup_spec())
+        if kind == "local":
+            return self.staged and bool(self.tpl and self.tpl.get("local_question"))
         if kind == "retire":
             return self.live["since"] is not None
         if kind == "class":
@@ -455,16 +580,26 @@ class Device:
             return self.has_host_question()
         if kind == "consent":
             return self.will_have_fix() or any(isinstance(v, dict) for v in self.rem.values())
+        if kind == "announce":
+            return (self.needs_announce() or self.effective_class() == "ask"
+                    or any(isinstance(v, dict) and "ask" in v for v in self.rem.values()))
         if kind == "drill":
             return self.will_have_fix()
         if kind == "nag":
-            return bool(self.codes_at("chronic"))
+            return bool(self.codes_at(*NAG_LAYERS))
         return False
 
     def open_kinds(self):
         """Kinds still worth asking, in ask order. An answered kind is never
         re-asked; a decision the config already holds is never asked."""
         out = []
+        if self.applies("setup") and self.missing_setup():
+            # nothing else can be asked about a device whose target is unknown
+            return ["setup"]
+        if self.applies("extras") and not self.ans("extras"):
+            out.append("extras")
+        if self.applies("local") and not self.ans("local"):
+            out.append("local")
         cls = self.effective_class()
         if self.applies("retire") and not self.ans("retire"):
             age = now() - self.live["since"]
@@ -484,10 +619,12 @@ class Device:
             out.append("host")
         if self.applies("consent") and not self.ans("consent") and self.will_have_ask_without_consent():
             out.append("consent")
+        if self.applies("announce") and not self.ans("announce") and self.needs_announce():
+            out.append("announce")
         if self.applies("drill") and not self.ans("drill") and self.is_open("doctrine.drill"):
             out.append("drill")
         if self.applies("nag") and not self.ans("nag"):
-            if any(self.is_open(f"realert_minutes_by_code.{c}") for c in self.codes_at("chronic")):
+            if any(self.is_open(f"realert_minutes_by_code.{c}") for c in self.codes_at(*NAG_LAYERS)):
                 out.append("nag")
         return out
 
@@ -498,6 +635,13 @@ class Device:
         first. Live trouble beats everything; then devices a shipped fix would
         unlock; then undecided classes; then noise risks."""
         score, why = 0, []
+        if self.staged:
+            if self.missing_setup():
+                score += 50
+                why.append(f"newly added - I still need {', '.join(self.missing_setup())} to watch it at all")
+            else:
+                score += 35
+                why.append("added through the interview - not in services.json until fill --apply")
         if self.live["pending"]:
             score += 100
             why.append("awaiting your approval right now")
@@ -527,7 +671,10 @@ class Device:
             why.append(f"its host ({self.host_text()}) can go dark")
         if "nag" in self.open_kinds():
             score += 10
-            why.append(f"{', '.join(self.codes_at('chronic'))} will nag at the default cadence")
+            why.append(f"{', '.join(self.codes_at(*NAG_LAYERS))} will nag at the default cadence")
+        if "announce" in self.open_kinds():
+            score += 15
+            why.append("the household gets no heads-up before its ask-first fix runs")
         if not self.tpl and not self.rem:
             why.append("bespoke check with an empty remediations map - list its codes (null = tell) and I can ask about them")
         return score, why
@@ -550,15 +697,33 @@ class Device:
                         f"do not apply - ssh:<user@host> runs a forced-command key there)")
         since = self.live["since"]
         root = self.dep.state.get(self.name, {})
+        # setup/extras: the params still open, each with the catalog's one-liner
+        spec = self.setup_spec() or {}
+        about = spec.get("about", {})
+
+        def describe(keys):
+            return "; ".join(f"{k} = {about[k]}" if about.get(k) else k for k in keys)
+
+        required = describe([k for k in spec.get("required", []) if k not in self.params])
+        anys = spec.get("required_any", [])
+        if anys and not any(all(k in self.params for k in g) for g in anys):
+            required = (required + "; " if required else "") + "one of: " + \
+                " — or — ".join(describe(g) for g in anys)
+        optional = describe([k for k in spec.get("optional", []) if k not in self.params])
+        scope = self.consent_scope() or "household"
         fields = {
             "name": self.name,
+            "kind": self.kind_name(),
+            "required": required or "nothing more",
+            "optional": optional or "nothing more",
+            "who": scope.split(":", 1)[1] if scope.startswith("named:") else "the household",
             "target": self.target_text(),
             "codes": ", ".join(sorted(self.codes)) or "whatever its check emits",
             "fixable": fixable,
             "options": options,
             "host": self.host_text(),
             "hostcodes": ", ".join(self.codes_at("host")) or "HOST_DOWN",
-            "chronic": ", ".join(self.codes_at("chronic")) or "its degraded codes",
+            "chronic": ", ".join(self.codes_at(*NAG_LAYERS)) or "its degraded codes",
             "status": root.get("last_status_code") or root.get("status") or "failing",
             "since": iso(since)[:10] if since else "a while",
         }
@@ -609,6 +774,44 @@ def parse_answer(kind, text):
     return key, value, arg
 
 
+def parse_special(dev, kind, text):
+    """The kinds with their own grammar: setup/extras (KEY=value pairs),
+    announce (free text for the household). Returns (key, value) or dies with
+    the reason - the same refusals `fill` would otherwise hit later."""
+    accepts = CATALOG["questions"][kind]["accepts"]
+    if kind in PAIR_KINDS:
+        pairs = parse_pairs(text, allow_none=(kind == "extras"))
+        if pairs is None:
+            die(f"could not read that as a '{kind}' answer. Accepted: {accepts}", 64)
+        reserved = [k for k in pairs if re.match(RESERVED_PARAM_RE, k)]
+        if reserved:
+            die(f"{', '.join(reserved)}: engine-owned name(s) - the engine refuses a service whose "
+                f"params set SELFHEAL_*/GATE_*/PATH-like keys", 64)
+        if "CHECK_KEY" in pairs:
+            die("CHECK_KEY is set to the service name for you - leave it out", 64)
+        unknown = sorted(k for k in pairs if k not in dev.known_params())
+        if kind == "setup" and unknown:
+            die(f"setup takes only the params {Path(dev.svc['check']).name} documents "
+                f"({', '.join(sorted(dev.known_params()))}); {', '.join(unknown)} can go in "
+                f"the extras answer", 64)
+        if unknown:
+            print(f"note: {', '.join(unknown)} - not a parameter {Path(dev.svc['check']).name} "
+                  f"documents; kept as given (remediation and hook params live here too)")
+        return "params", pairs
+    if kind == "announce":
+        t = " ".join(text.split())
+        if len(t) < 8:
+            die(f"an announcement needs a sentence the household can act on. Accepted: {accepts}", 64)
+        low = t.lower()
+        bad = [f for f in ANNOUNCE_FORBIDDEN if f.lower() in low]
+        codes = [w for w in re.findall(r"\b[A-Z][A-Z0-9]*_[A-Z0-9_]+\b", t)]
+        if bad or codes:
+            die(f"that reads like an alert, not a heads-up for the household - leave out "
+                f"{', '.join(bad + codes)}", 64)
+        return "text", t
+    return None
+
+
 def cmd_answer(dep, args):
     if args.kind not in KINDS:
         die(f"unknown question kind '{args.kind}' (one of {', '.join(KINDS)})")
@@ -617,6 +820,24 @@ def cmd_answer(dep, args):
     if not dev.applies(args.kind):
         die(f"'{args.kind}' does not apply to {dev.name} "
             f"({dev.target_text()}: codes {', '.join(sorted(dev.codes)) or 'none listed'})")
+    special = parse_special(dev, args.kind, args.text)
+    if special:
+        key, value = special
+        record = {"key": key, "value": value, "text": args.text.strip(), "at": iso(now()),
+                  "question": dev.question(args.kind)["ask"]}
+        dep.answers["devices"].setdefault(dev.name, {})[args.kind] = record
+        dep.save_answers()
+        fresh = Device(dep, dep.service(args.device))
+        nxt = fresh.open_kinds()
+        shown = ", ".join(f"{k}={v}" for k, v in value.items()) if isinstance(value, dict) else value
+        print(f"recorded {dev.name}:{args.kind} = {shown or 'none'}")
+        if args.kind == "setup" and fresh.missing_setup():
+            print(f"still needed for {dev.name}: {', '.join(fresh.missing_setup())}")
+        elif nxt:
+            print(f"next for {dev.name}: {nxt[0]}   (python3 {sys.argv[0]} next --device {dev.name})")
+        else:
+            print(f"{dev.name}: nothing more to ask - run `fill` to see what it maps to")
+        return
     parsed = parse_answer(args.kind, args.text)
     if not parsed:
         die(f"could not read that as a '{args.kind}' answer. Accepted: "
@@ -643,7 +864,7 @@ def cmd_answer(dep, args):
         record["arg"] = arg
     dep.answers["devices"].setdefault(dev.name, {})[args.kind] = record
     dep.save_answers()
-    fresh = Device(dep, svc)
+    fresh = Device(dep, dep.service(args.device))   # a staged device is re-derived from its answers
     nxt = fresh.open_kinds()
     print(f"recorded {dev.name}:{args.kind} = {key}" + (f" ({value})" if value else "")
           + (f" arg={arg}" if arg else ""))
@@ -651,6 +872,28 @@ def cmd_answer(dep, args):
         print(f"next for {dev.name}: {nxt[0]}   (python3 {sys.argv[0]} next --device {dev.name})")
     else:
         print(f"{dev.name}: nothing more to ask - run `fill` to see what it maps to")
+
+
+def cmd_add(dep, args):
+    """Stage a new device: name + kind. The setup question then collects the
+    params its check cannot run without, extras the optional ones, and the
+    usual decisions follow. The service is written by `fill --apply` - a stub
+    written now would start paging (watch-only) at the next cron cycle."""
+    name = args.name
+    if not re.fullmatch(NAME_RE, name):
+        die(f"'{name}' is not a service name (letters, digits, . _ -; no spaces, no slash; max 64)", 64)
+    check = ADD_KINDS.get(args.kind) or (args.kind if args.kind in CATALOG["templates"] else None)
+    if not check:
+        die(f"unknown kind '{args.kind}' - one of {', '.join(ADD_KINDS)} (or a catalog template path)", 64)
+    if any(s.get("name") == name for s in dep.config.get("services", [])):
+        die(f"{name} is already in {dep.config_path} - `next --device {name}` asks about it")
+    if name in dep.staged():
+        die(f"{name} is already staged - `next --device {name}` continues its questions")
+    dep.answers.setdefault("added", {})[name] = {"check": check, "kind": args.kind, "at": iso(now())}
+    dep.save_answers()
+    d = Device(dep, dep.service(name))
+    print(f"staged {name} ({args.kind} -> {check}); nothing is written until `fill --apply`")
+    print_question(d, d.question(d.open_kinds()[0]))
 
 
 def cmd_reask(dep, args):
@@ -788,11 +1031,19 @@ def plan_device(dev):
             if dev.ans("consent"):
                 c, who = dev.ans("consent"), dev.ans_value("consent")
                 new["consent"] = f"named:{who}" if c == "named" else c
+            if dev.ans("announce") and new.get("consent") not in (None, "admin"):
+                new["announce"] = dev.ans_value("announce")
         for code in codes:
             want(f"remediations.{code}", new, why)
         want_param("REMEDIATION_KEY", dev.name, why)
         for k, v in fix_params(fix_key, value).items():
             want_param(k, v, why)
+
+    # setup: a hand-written entry missing a param its check needs -----------
+    # (a staged device's params are written with the service itself in cmd_fill)
+    if not dev.staged and dev.ans("setup"):
+        for k, v in dev.ans_value("setup").items():
+            want_param(k, v, "setup")
 
     # retire ------------------------------------------------------------------
     if dev.ans("retire") == "retire":
@@ -854,10 +1105,20 @@ def plan_device(dev):
         if rest:
             want("consent_notes", rest, f"consent={scope}")
 
+    # announce: the household's heads-up on every ask-first entry whose consent
+    # reaches beyond the admin (wire_fix adds it to entries it writes itself)
+    if dev.ans("announce"):
+        text = dev.ans_value("announce")
+        for code, v in rem.items():
+            if (isinstance(v, dict) and "ask" in v
+                    and (v.get("consent") or dev.consent_scope()) not in (None, "admin")
+                    and (not v.get("announce") or dev.is_open(f"remediations.{code}"))):
+                want(f"remediations.{code}", dict(v, announce=text), "announce")
+
     # nag ---------------------------------------------------------------------
     if dev.ans("nag"):
         minutes = {"daily": 1440, "hourly": 60, "digest": 1440}[dev.ans("nag")]
-        for code in dev.codes_at("chronic"):
+        for code in dev.codes_at(*NAG_LAYERS):
             want(f"realert_minutes_by_code.{code}", minutes, f"nag={dev.ans('nag')}")
             if dev.ans("nag") == "digest":
                 want(f"notify_by_code.{code}", "digest", "nag=digest")
@@ -981,12 +1242,41 @@ def cmd_fill(dep, args):
         targets = [Device(dep, dep.service(args.device), redo=args.overwrite)]
     else:
         targets = devices(dep)
-    total, any_kept, written, written_fields = 0, False, [], set()
+    total, any_kept, written, written_fields, added_now = 0, False, [], set(), []
     for dev in targets:
+        header_done = False
+        if dev.staged:
+            if dev.missing_setup():
+                print(dev.name)
+                print(f"  ! not written - still needs {', '.join(dev.missing_setup())} (answer its setup question)")
+                continue
+            # the new service itself, with provenance on every field it brings
+            new_svc = {k: v for k, v in dev.svc.items() if k != "_staged"}
+            dep.config.setdefault("services", []).append(new_svc)
+            stamp = iso(now())
+            prov = new_svc.setdefault("_interview", {})
+            print(dev.name)
+            header_done = True
+            print(f"  + service {dev.name} = {json.dumps(new_svc['check'])}   (add {dev.kind_name()})")
+            prov["check"] = {"at": stamp, "why": f"add {dev.kind_name()}", "value": new_svc["check"]}
+            for k, v in new_svc["params"].items():
+                why = "setup" if k != "CHECK_KEY" and k in (dev.ans_value("setup") or {}) else \
+                      ("extras" if k in (dev.ans_value("extras") or {}) else "add")
+                print(f"  + params.{k} = {json.dumps(v)}   ({why})")
+                prov[f"params.{k}"] = {"at": stamp, "why": why, "value": v}
+            if new_svc.get("local"):
+                print(f"  + local = true   (local=yes)")
+                prov["local"] = {"at": stamp, "why": "local=yes", "value": True}
+            total += 1 + len(new_svc["params"]) + (1 if new_svc.get("local") else 0)
+            written.append(dev.name)
+            added_now.append(dev.name)
+            written_fields |= {(dev.name, "check")} | {(dev.name, f"params.{k}") for k in new_svc["params"]}
+            dev = Device(dep, new_svc)      # its decisions follow, as for any service
         changes, kept, notes = plan_device(dev)
         if not (changes or kept or notes):
             continue
-        print(dev.name)
+        if not header_done:
+            print(dev.name)
         for ch in changes:
             mark = "~" if ch.present else "+"
             old = f"{fmt(ch.old)} -> " if ch.present else ""
@@ -1010,10 +1300,13 @@ def cmd_fill(dep, args):
             dep.config_path.name + ".backup-" + now().strftime("%Y%m%d%H%M%S"))
         shutil.copy2(dep.config_path, backup)
         save_json(dep.config_path, dep.config)
-        # a redo is complete once its fills are in the config
+        # a redo is complete once its fills are in the config; an added device
+        # is a real service now
         reask = dep.answers.get("reask", [])
-        if any(n in reask for n in written):
+        if any(n in reask for n in written) or added_now:
             dep.answers["reask"] = [n for n in reask if n not in written]
+            for n in added_now:
+                dep.answers.get("added", {}).pop(n, None)
             dep.save_answers()
         print(f"applied {total} change(s) to {dep.config_path} (backup: {backup.name})")
         report_lint(dep, dep.config_path, written_fields)
@@ -1029,7 +1322,7 @@ def cmd_fill(dep, args):
 
 def cmd_plan(dep, args):
     ds = ranked(dep)
-    disabled = len(dep.config.get("services", [])) - len(dep.services())
+    disabled = sum(1 for s in dep.config.get("services", []) if not s.get("enabled", True))
     if args.json:
         print(json.dumps([{"device": d.name, "score": d.priority()[0], "open": d.open_kinds(),
                            "why": d.priority()[1]} for d in ds], indent=2))
@@ -1077,6 +1370,10 @@ def cmd_next(dep, args):
     if args.json:
         print(json.dumps(q, indent=2, ensure_ascii=False))
         return
+    print_question(d, q)
+
+
+def print_question(d, q):
     print(f"[{q['id']}] ({q['u']})")
     print(q["ask"])
     print(f"  accepts: {q['accepts']}")
@@ -1087,16 +1384,19 @@ def cmd_next(dep, args):
 def cmd_status(dep, args):
     rows = []
     for d in devices(dep):
-        answered = {k: f"{v['key']}" + (f":{v['value']}" if v.get("value") else "")
+        answered = {k: (f"{v['key']}" + (f":{v['value']}" if v.get("value") else ""))
+                    if not isinstance(v.get("value"), dict) else ",".join(v["value"])
                     for k, v in d.answers.items()}
         rows.append({"device": d.name, "class": d.effective_class(), "answered": answered,
-                     "open": d.open_kinds(), "filled": sorted(d.prov)})
+                     "open": d.open_kinds(), "filled": sorted(d.prov), "staged": d.staged})
     if args.json:
         print(json.dumps(rows, indent=2))
         return
+    staged = set(dep.staged())
     for r in rows:
         ans = ", ".join(f"{k}={v}" for k, v in r["answered"].items()) or "-"
-        print(f"{r['device']}: class={r['class'] or 'undecided'}  answered: {ans}  "
+        tag = " (staged - not in services.json yet)" if r["device"] in staged else ""
+        print(f"{r['device']}{tag}: class={r['class'] or 'undecided'}  answered: {ans}  "
               f"open: {', '.join(r['open']) or 'none'}  filled: {len(r['filled'])} field(s)")
     arch = dep.answers.get("archived", [])
     if arch:
@@ -1121,6 +1421,8 @@ def cmd_doctrine(dep, args):
     never = []
     for d in ds:
         cls = {"fix": "auto", "ask": "ask-first", "tell": "watch-only"}.get(d.effective_class(), "undecided")
+        if cls == "undecided" and d.tpl and not d.fixable_codes:
+            cls = "watch-only (alert-only check)"     # nothing a fix could apply to
         note = d.answers.get("class", {}).get("text", "")
         if d.ans("host") == "severs":
             never.append(f"{d.name}'s host ({d.host_text()}): \"{d.answers['host']['text']}\"")
@@ -1142,12 +1444,14 @@ def cmd_doctrine(dep, args):
     out.extend(f"- {n}" for n in never) if never else out.append("none recorded")
     out.append("")
     out.append("## Consent map (U10, U11)")
-    cons = [(d.name, d.answers["consent"]["text"]) for d in ds if d.ans("consent")]
-    out.extend(f"- {n}: \"{t}\"" for n, t in cons) if cons else out.append("none recorded")
+    cons = [(d.name, d.answers["consent"]["text"],
+             d.ans_value("announce") if d.ans("announce") else None) for d in ds if d.ans("consent")]
+    out.extend(f"- {n}: \"{t}\"" + (f" — the household hears: \"{a}\"" if a else "")
+               for n, t, a in cons) if cons else out.append("none recorded")
     out.append("(U11 voice/guest exposure: not covered by the per-device interview)")
     out.append("")
     out.append("## Alert budget (U4, U5)")
-    nags = [(d.name, d.answers["nag"]["key"], ", ".join(d.codes_at("chronic"))) for d in ds if d.ans("nag")]
+    nags = [(d.name, d.answers["nag"]["key"], ", ".join(d.codes_at(*NAG_LAYERS))) for d in ds if d.ans("nag")]
     out.extend(f"- {n}: {c} remind {k}" for n, k, c in nags) if nags else out.append("no nag cadences recorded")
     out.append("(U4 pages/day budget: not covered by the per-device interview — ask it in conversation)")
     out.append("")
@@ -1176,6 +1480,11 @@ def main():
     ap.add_argument("--config", default=str(ROOT / "services.json"))
     ap.add_argument("--answers", default=None, help="answers store (default <config dir>/interview.json)")
     sub = ap.add_subparsers(dest="cmd", required=True)
+
+    p = sub.add_parser("add", help="stage a new device: name + kind; its params come from the setup questions")
+    p.add_argument("name")
+    p.add_argument("kind", help=", ".join(ADD_KINDS))
+    p.set_defaults(fn=cmd_add)
 
     p = sub.add_parser("plan", help="rank devices with open decisions")
     p.add_argument("--json", action="store_true")

@@ -14,12 +14,39 @@
     "inventory":  "something changed on the LAN - a human decides if that is fine"
   },
   "fixable_layers": ["service", "state"],
+  "nag_layers": ["chronic", "upstream"],
+
+  "_setup_fields": "kinds: the short names `interview.py add <name> <kind>` accepts for each check template. Per template, setup: required = params the check refuses to run without; required_any = alternatives, one group must be satisfied; optional = params the check documents (anything else the admin sets is kept with a note - remediation params live in the same block); about = the one-line meaning shown in the setup question; local_question: ask whether the device is on THIS box (keeps being checked while the LAN is down).",
+  "kinds": {
+    "http": "checks/templates/check-http.sh",
+    "tcp": "checks/templates/check-tcp-port.sh",
+    "dns": "checks/templates/check-dns.sh",
+    "systemd": "checks/templates/check-systemd-unit.sh",
+    "disk": "checks/templates/check-disk-space.sh",
+    "cert": "checks/templates/check-cert-expiry.sh",
+    "ha-entity": "checks/templates/check-ha-entity.sh",
+    "host-power": "checks/templates/check-host-power.sh",
+    "lan-inventory": "checks/templates/check-lan-inventory.sh"
+  },
 
   "templates": {
     "checks/templates/check-http.sh": {
       "target": ["HTTP_URL"],
       "host_param": "HOST_IP",
       "target_host_param": ["HOST_IP", "HTTP_URL"],
+      "setup": {
+        "required": ["HTTP_URL"],
+        "optional": ["HOST_IP", "HTTP_URL_ALT", "ALT_GUARD_CMD", "HTTP_EXPECT", "HTTP_AUTH_HEADER", "HTTP_TOKEN_FILE"],
+        "about": {
+          "HTTP_URL": "the health URL on the LAN (prefer an IP literal so a DNS outage can't blind the check)",
+          "HOST_IP": "the host's IP, so I can tell 'service down' from 'host down' with a ping",
+          "HTTP_URL_ALT": "a second transport to the same service (e.g. its tailnet URL)",
+          "ALT_GUARD_CMD": "a command that must succeed before I trust the second transport (bin/tailscale-running.sh)",
+          "HTTP_EXPECT": "the status code that means healthy (default 200)",
+          "HTTP_AUTH_HEADER": "an auth header, e.g. 'Authorization: Bearer ...' - reference a token FILE, never paste a token",
+          "HTTP_TOKEN_FILE": "a mode-600 file that exports the header's token"
+        }
+      },
       "codes": {
         "AUTH_FAILED": "credential",
         "API_ERROR": "service",
@@ -33,6 +60,16 @@
       "target": ["TCP_HOST", "TCP_PORT"],
       "host_param": "TCP_HOST",
       "target_host_param": "TCP_HOST",
+      "setup": {
+        "required": ["TCP_HOST", "TCP_PORT"],
+        "optional": ["TCP_TIMEOUT", "PING_SPLIT"],
+        "about": {
+          "TCP_HOST": "the host to connect to (IP literal preferred)",
+          "TCP_PORT": "the TCP port that must accept a connection",
+          "TCP_TIMEOUT": "connect timeout in seconds (default 3)",
+          "PING_SPLIT": "1 (default) to tell PORT_CLOSED from HOST_DOWN with a ping, 0 to skip the ping"
+        }
+      },
       "codes": {
         "PORT_CLOSED": "service",
         "HOST_DOWN": "host"
@@ -40,6 +77,15 @@
     },
     "checks/templates/check-dns.sh": {
       "target": ["RESOLVER_IP"],
+      "setup": {
+        "required": ["RESOLVER_IP"],
+        "optional": ["TEST_DOMAIN", "OWNER_HOST_IP"],
+        "about": {
+          "RESOLVER_IP": "the resolver's IP",
+          "TEST_DOMAIN": "a name to resolve (default example.com)",
+          "OWNER_HOST_IP": "the resolver's host IP - when it does not ping, this check stays silent and lets the host's own service report"
+        }
+      },
       "codes": {
         "DNS_DOWN": "service",
         "UPSTREAM_DOWN": "upstream"
@@ -48,6 +94,18 @@
     "checks/templates/check-systemd-unit.sh": {
       "target": ["UNIT"],
       "default_fix": {"kind": "systemd", "from_param": "UNIT"},
+      "local_question": true,
+      "setup": {
+        "required": ["UNIT"],
+        "optional": ["UNIT_SCOPE", "PORT", "LOG_GLOB", "WEDGE_MINUTES"],
+        "about": {
+          "UNIT": "the systemd unit name",
+          "UNIT_SCOPE": "user (default) or system",
+          "PORT": "a local TCP port the unit must answer on",
+          "LOG_GLOB": "the unit's file-log glob, newest file by mtime (for the wedge heuristic)",
+          "WEDGE_MINUTES": "both log sinks quiet this long = wedged (default 75)"
+        }
+      },
       "codes": {
         "UNIT_INACTIVE": "service",
         "PORT_DEAD": "service",
@@ -56,6 +114,17 @@
     },
     "checks/templates/check-disk-space.sh": {
       "target": ["MOUNT_PATH"],
+      "local_question": true,
+      "setup": {
+        "required": ["MOUNT_PATH"],
+        "optional": ["MIN_FREE_PCT", "MARKER_DIRS", "REQUIRE_WRITABLE"],
+        "about": {
+          "MOUNT_PATH": "the directory that must be a live mount",
+          "MIN_FREE_PCT": "below this much free space I report LOW_SPACE (default 10)",
+          "MARKER_DIRS": "space-separated subpaths that prove the RIGHT volume is mounted",
+          "REQUIRE_WRITABLE": "1 to report VOLUME_READONLY when the mount is not writable"
+        }
+      },
       "codes": {
         "VOLUME_ABSENT": "hardware",
         "MARKER_MISSING": "hardware",
@@ -65,6 +134,18 @@
     },
     "checks/templates/check-cert-expiry.sh": {
       "target": ["CERT_FILE", "CERT_HOST"],
+      "setup": {
+        "required": [],
+        "required_any": [["CERT_FILE"], ["CERT_HOST"]],
+        "optional": ["CERT_PORT", "WARN_DAYS", "CRIT_DAYS"],
+        "about": {
+          "CERT_FILE": "a PEM file to inspect - or instead",
+          "CERT_HOST": "a live TLS endpoint's host",
+          "CERT_PORT": "its port (default 443)",
+          "WARN_DAYS": "days left at which I start nagging (default 21)",
+          "CRIT_DAYS": "days left at which it becomes a page (default 7)"
+        }
+      },
       "codes": {
         "CERT_EXPIRED": "credential",
         "CERT_EXPIRING": "chronic",
@@ -74,6 +155,21 @@
     "checks/templates/check-ha-entity.sh": {
       "target": ["ENTITY_ID"],
       "default_fix": {"kind": "ha"},
+      "setup": {
+        "required": ["HA_URL", "ENTITY_ID"],
+        "required_any": [["HA_TOKEN_FILE"], ["HA_TOKEN"]],
+        "optional": ["VALUE_LOW", "VALUE_CRITICAL", "EXPECT_STATE", "BLIND_MINUTES"],
+        "about": {
+          "HA_URL": "the Home Assistant URL (IP literal preferred)",
+          "ENTITY_ID": "the entity to watch",
+          "HA_TOKEN_FILE": "a mode-600 file that exports HA_TOKEN - never paste the token itself",
+          "HA_TOKEN": "(prefer HA_TOKEN_FILE)",
+          "VALUE_LOW": "at or below this numeric value I report VALUE_LOW",
+          "VALUE_CRITICAL": "at or below this I report VALUE_CRITICAL",
+          "EXPECT_STATE": "any other state is a STATE_MISMATCH",
+          "BLIND_MINUTES": "unavailable/unknown this long = ENTITY_BLIND (default 15)"
+        }
+      },
       "codes": {
         "ENTITY_BLIND": "sensor",
         "VALUE_CRITICAL": "state",
@@ -84,6 +180,16 @@
     "checks/templates/check-host-power.sh": {
       "target": [],
       "target_text": "this box's own power supply",
+      "local_question": true,
+      "setup": {
+        "required": [],
+        "optional": ["AC_SYSFS", "BAT_SYSFS", "BAT_LOW_PCT"],
+        "about": {
+          "AC_SYSFS": "the AC supply's sysfs path (default /sys/class/power_supply/AC)",
+          "BAT_SYSFS": "the battery's sysfs path (default /sys/class/power_supply/BAT0)",
+          "BAT_LOW_PCT": "battery percentage I call low (default 50)"
+        }
+      },
       "codes": {
         "ON_EXTERNAL_POWER_LOST": "hardware",
         "INTERNAL_BATTERY_LOW": "hardware",
@@ -92,6 +198,14 @@
     },
     "checks/templates/check-lan-inventory.sh": {
       "target": ["INVENTORY_FILE"],
+      "local_question": true,
+      "setup": {
+        "required": ["INVENTORY_FILE"],
+        "optional": [],
+        "about": {
+          "INVENTORY_FILE": "the JSON inventory of hosts (self_ip + name/ip/mac per host) I compare the LAN against"
+        }
+      },
       "codes": {
         "SELF_IP_CHANGED": "inventory",
         "DEVICE_CHANGED": "inventory",
@@ -167,6 +281,30 @@
   },
 
   "questions": {
+    "setup": {
+      "u": "D6",
+      "ask": "To watch {name} ({kind}) I need: {required}. Give them as KEY=value, space-separated.",
+      "accepts": "KEY=value [KEY=value ...]  (the keys listed; nothing else yet)",
+      "maps_to": "params.<KEY> on the new service (CHECK_KEY is set to the service name for you)"
+    },
+    "extras": {
+      "u": "D6",
+      "ask": "Anything else to set on {name}? Its check also understands: {optional}. Remediation params can go here too (e.g. a rate cap). Or 'none'.",
+      "accepts": "none | KEY=value [KEY=value ...]  (a key the check does not document is kept, with a note)",
+      "maps_to": "params.<KEY> on the new service"
+    },
+    "local": {
+      "u": "D6",
+      "ask": "Is {name} on this box itself - so I should keep checking it even while the home network is down?",
+      "accepts": "yes | no  (then your words)",
+      "maps_to": "local: true on the service (the network gate skips remote services when the gateway is unreachable)"
+    },
+    "announce": {
+      "u": "U10",
+      "ask": "When I run {name}'s fix after your OK, what should the household hear first? Plain words for {who} - what blips and roughly how long; no codes, no 'reply heal'.",
+      "accepts": "the announcement text, verbatim (one or two sentences)",
+      "maps_to": "announce on each ask-first entry whose consent is household or named:<person>; the drainer sends it to the announce chat before the fix runs"
+    },
     "retire": {
       "u": "U13",
       "ask": "{name} has been {status} since {since} and nothing has been done about it - is it retired, or still wanted?",
@@ -205,7 +343,7 @@
     },
     "nag": {
       "u": "U5",
-      "ask": "When {name} is broken in a way only you can fix ({chronic} - a router setting, a cable, a renewal), how often do I remind you?",
+      "ask": "When {name} is broken in a way only you (or the ISP) can fix ({chronic} - a router setting, a cable, a renewal, the internet itself), how often do I remind you?",
       "accepts": "daily | hourly | digest (evening summary only)",
       "maps_to": "realert_minutes_by_code (1440 / 60) and notify_by_code: digest for {chronic}"
     }

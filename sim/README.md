@@ -46,7 +46,23 @@ python3 sim/report.py --run sim/.run/out
 python3 sim/soak.py --gen-seed 42 --days 45 --out sim/.run/out-seeded
 python3 sim/report.py --run sim/.run/out-seeded
 python3 sim/soak.py --selftest            # equivalence + determinism (slow: see below)
+bash sim/interview-lab.sh                 # the interview builds the casa config from NOTHING, then the soak runs on it
 ```
+
+## Interview lab (`sim/interview-lab.sh`)
+
+The interview against a populated home it has never seen. The casa world
+comes up, then its `services.json` is emptied: **no services**. Every device
+enters through `onboard/interview.py` alone — `add <name> <kind>`, then one
+question at a time, answered in Dana's words (`sim/cloud/persona-admin.md`;
+lab plumbing such as the casa control script rides in the `extras` answer,
+where a real admin puts remediation params) — and `fill --apply` is the only
+writer. It then shows how that came out: the full Q&A transcript
+(`sim/.run/lab/interview-transcript.md`), the interview-built config diffed
+field by field against the hand-written `casa/overlay/services.casa.json`,
+`sim/cloud/interview-check.py` grading Dana's stances, the doctrine draft,
+and finally the 90-day soak + gates G1–G10 run on the interview-built config
+(`soak.py --services`). `--no-soak` stops after the diff and the check.
 
 Runs must NOT overlap: the casa world uses fixed loopback ports (18324/18325
 plex, 18446 nas) and one hosts dir.

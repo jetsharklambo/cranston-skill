@@ -39,6 +39,7 @@ import io
 import json
 import os
 import re
+import shutil
 import socket
 import subprocess
 import sys
@@ -212,8 +213,11 @@ def read_json(path, default):
 class Soak:
     def __init__(self, meta, events, out, faithful=False,
                  casa_run=None, sent_window=None, no_selfheal_now=False,
-                 override_defaults=None):
+                 override_defaults=None, services_file=None):
         self.override_defaults = override_defaults or {}
+        # a services.json to run INSTEAD of the casa overlay's - e.g. one the
+        # interview built (sim/interview-lab.sh); copied in after up-casa.sh
+        self.services_file = Path(services_file) if services_file else None
         self.meta, self.events = meta, events
         self.acts, self.end = expand(events)
         self.out = Path(out)
@@ -252,6 +256,8 @@ class Soak:
         for f in (self.stub_log, self.run_log):
             f.unlink(missing_ok=True)
         self.transcript = open(self.out / "transcript.log", "w")
+        if self.services_file:
+            shutil.copy(self.services_file, self.cfg)
         if self.override_defaults:  # test knob (e.g. a shorter cooldown)
             config = json.load(open(self.cfg))
             config.setdefault("defaults", {}).update(self.override_defaults)
@@ -737,6 +743,9 @@ def main():
     ap.add_argument("--out", default=str(SIM / ".run" / "out"))
     ap.add_argument("--casa-run", default=None,
                     help="casa world dir (default sim/.run/casa; rebuilt per run)")
+    ap.add_argument("--services", default=None,
+                    help="run this services.json instead of the casa overlay's (e.g. one the "
+                         "interview built); copied into the deploy after the world is built")
     ap.add_argument("--cron-faithful", action="store_true",
                     help="run every 2-min cycle instead of the hot/cold scheduler")
     ap.add_argument("--sent-window", type=int, default=None,

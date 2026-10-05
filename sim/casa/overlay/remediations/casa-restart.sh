@@ -15,10 +15,13 @@ LIB="${SELFHEAL_ROOT:-$(cd "$(dirname "$0")/.." && pwd)}/engine/lib"
 . "$LIB/remediation.sh"
 
 CTL="${CASACTL:-casa-ctl}"
-TARGET="${1:-${CASA_SVC:-}}"
+# the one argument, else the CASA_SVC param, else the service key itself: a
+# config the interview wrote carries REMEDIATION_KEY, not CASA_SVC, and in
+# casa the service key IS the fake service's name
+TARGET="${1:-${CASA_SVC:-${REMEDIATION_KEY:-}}}"
 rem_begin "${TARGET:-casa}" "casa-restart"
 rem_cap "${CAP_MAX:-99}" "${CAP_WINDOW_H:-6}"
-[ -n "$TARGET" ] || rem_refuse "no target service (argument or CASA_SVC param)"
+[ -n "$TARGET" ] || rem_refuse "no target service (argument, CASA_SVC or REMEDIATION_KEY param)"
 case "$TARGET" in pihole-dns|truenas-smb|plex|plex-primary|plex-alt) ;;
     *) rem_refuse "unknown casa service '$TARGET'" ;; esac
 

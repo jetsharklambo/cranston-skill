@@ -61,6 +61,12 @@ jobs:
           python3 sim/soak.py --gen-seed 42 --days 45 --out sim/.run/out-seed42
           python3 sim/report.py --run sim/.run/out-seed42
 
+      # The interview against a populated home it has never seen: the casa
+      # config is emptied, every device enters through `add` + one question at
+      # a time, then the 90-day soak + gates run on the interview-built config.
+      - name: Interview lab (offline)
+        run: bash sim/interview-lab.sh
+
       # Generic example-LAN addresses (192.168.1.x) are allowed by design; this
       # hunts real identifiers: secrets, home paths, non-doc-range tailnet IPs.
       - name: No secrets, personal paths, or real tailnet IPs in the views

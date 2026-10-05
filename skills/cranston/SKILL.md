@@ -197,6 +197,7 @@ the home, or would rather be *asked* than fill in fields by hand (index:
    the front is what maps). Re-interview one device, never the whole house.
 
    ```bash
+   python3 "$DEPLOY/onboard/interview.py" add <device> <kind>    # a device not in the config yet (http, tcp, dns, systemd, disk, cert, ha-entity, host-power, lan-inventory)
    python3 "$DEPLOY/onboard/interview.py" plan                   # ranked devices + why
    python3 "$DEPLOY/onboard/interview.py" next                   # one question (--device <name> to pick)
    python3 "$DEPLOY/onboard/interview.py" answer <device> <kind> "<the admin's words>"
