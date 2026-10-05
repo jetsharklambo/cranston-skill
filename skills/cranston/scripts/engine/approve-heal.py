@@ -118,6 +118,14 @@ def svc_env(svc, state_dir, audit_log):
     it - which split the audit trail and made the cap count every deployment
     on the box (a bug the sandbox drills found)."""
     env = {k: v for k, v in os.environ.items() if not re.match(STRIP_RE, k)}
+    # One deliberate survivor of the strip: the alert QUEUE path. It is a
+    # data file the sink appends to (never executed, never a gate input), the
+    # cron env file is its legitimate carrier, and without it the consent
+    # announcement and any sink call from this path quietly land in
+    # send-alert.sh's /tmp default - a queue no drainer reads. A params block
+    # still cannot plant it: SELFHEAL_* params are refused upstream.
+    if "SELFHEAL_ALERT_FILE" in os.environ:
+        env["SELFHEAL_ALERT_FILE"] = os.environ["SELFHEAL_ALERT_FILE"]
     for k, v in (svc or {}).get("params", {}).items():
         env[str(k)] = str(v)
     if svc and "containers_auto" in svc:

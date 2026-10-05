@@ -831,8 +831,9 @@ def ah_pending(ah2, key, script, arg=None, **extra):
         {key: dict({"status_code": "C", "script": str(script), "arg": arg,
                     "expires": "2099-01-01T00:00:00Z"}, **extra)}))
 
-def ah_run(ah2, *argv):
+def ah_run(ah2, *argv, extra_env=None):
     env2 = dict(os.environ, SELFHEAL_CONFIG=str(ah2 / "services.json"))
+    env2.update(extra_env or {})
     return subprocess.run([sys.executable, str(ah2 / "engine" / "approve-heal.py"), *argv],
                           capture_output=True, text=True, env=env2)
 
@@ -1008,6 +1009,17 @@ ah_pending(ah, "svcX", noisy35, consent="admin", announce="never sent")
 r = ah_run(ah, "svcX")
 ok(r.returncode == 0 and order35.read_text().splitlines() == ["fix-ran"],
    "admin consent: no announcement, just the fix")
+# the alert QUEUE path survives the env scrub: without it the announce (and
+# any sink call) would land in send-alert.sh's /tmp default - a queue no
+# drainer reads on a deployment with a non-default SELFHEAL_ALERT_FILE
+order35.unlink()
+sink35.write_text("#!/bin/bash\n"
+                  f"echo \"sink:${{SELFHEAL_ALERT_FILE:-STRIPPED}}\" >> '{order35}'\n")
+ah_pending(ah, "svcX", noisy35, consent="household", announce="queue check")
+r = ah_run(ah, "svcX", extra_env={"SELFHEAL_ALERT_FILE": "/custom/queue.json"})
+ok(r.returncode == 0
+   and order35.read_text().splitlines()[0] == "sink:/custom/queue.json",
+   "inherited SELFHEAL_ALERT_FILE passes the scrub through to the announce sink")
 shutil.rmtree(ah)
 
 print(f"\nALL {PASS} ASSERTIONS PASSED")
