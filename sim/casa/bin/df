@@ -1,0 +1,34 @@
+#!/bin/bash
+# df PATH stub for the casa sim. checks/templates/check-disk-space.sh runs
+#   df -P "$MOUNT_PATH"
+# and awk-reads column 5 (Capacity%) of line 2. For a mount path listed in
+# $CASA_RUN/disk-table.json (written by `casa-ctl disk-fill`) this stub prints
+# a scripted df -P table; any other target is exec'd through the real df, so
+# the stub can sit first on PATH without breaking anything else.
+# The JSON is scraped with awk (index-based, no regex-escaping of the path)
+# to keep healthy soak cycles free of python startup cost.
+target=""
+for a in "$@"; do case "$a" in -*) ;; *) target="$a" ;; esac; done
+table="${CASA_RUN:-}/disk-table.json"
+if [ -n "$target" ] && [ -f "$table" ]; then
+    pct=$(awk -v t="\"$target\":" '{
+        i = index($0, t)
+        if (i) {
+            s = substr($0, i + length(t))
+            sub(/^[ ]*/, "", s); sub(/[^0-9].*$/, "", s)
+            if (s != "") print s
+        }
+    }' "$table" | head -n 1)
+    if [ -n "$pct" ]; then
+        printf 'Filesystem 512-blocks Used Available Capacity Mounted-on\n'
+        printf 'casasim 1000000 %s %s %s%% %s\n' \
+            $((pct * 10000)) $(((100 - pct) * 10000)) "$pct" "$target"
+        exit 0
+    fi
+fi
+self="$(cd "$(dirname "$0")" && pwd)/$(basename "$0")"
+for real in /bin/df /usr/bin/df; do
+    [ -x "$real" ] && [ "$real" != "$self" ] && exec "$real" "$@"
+done
+echo "df stub: no real df found for passthrough" >&2
+exit 1

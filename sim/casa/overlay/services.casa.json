@@ -1,0 +1,137 @@
+{
+  "version": 2,
+  "_note": "Casa sim config. Real-ish timings (realert 60, cooldown 30, hold 10) so messaging-frequency gates measure production cadence; only verify_delay (0) and check_timeout (10) are shortened - verification re-runs the check in the same sim minute, and nothing in the casa may legitimately take 45s. @RUN@ and @CASACTL@ are filled by sim/casa/up-casa.sh. alert_sink is bin/casa-sink.sh, a 3-line wrapper that pins SELFHEAL_ALERT_FILE from SELFHEAL_STATE_DIR and execs the REAL bin/send-alert.sh - needed because approve-heal.py strips SELFHEAL_* from the env of the announce sink it runs (see sim/README.md, 'known engine finding').",
+  "paths": {
+    "state_dir": "state",
+    "audit_log": "state/audit.log",
+    "digest_file": "state/digest.jsonl",
+    "alert_sink": "bin/casa-sink.sh",
+    "approval_gate": null
+  },
+  "defaults": {
+    "fail_threshold": 2,
+    "check_timeout_seconds": 10,
+    "cooldown_minutes": 30,
+    "max_attempts": 2,
+    "attempt_window_hours": 6,
+    "verify_delay_seconds": 0,
+    "realert_minutes": 60,
+    "recovery_hold_minutes": 10,
+    "pending_ttl_hours": 6,
+    "ask_demote_after": 3,
+    "post_outage_grace_minutes": 6,
+    "gateway_ip": "192.168.1.1"
+  },
+  "services": [
+    {
+      "name": "pihole-dns",
+      "enabled": true,
+      "_note": "AUTO class: DNS_DOWN restarts the resolver unasked; UPSTREAM_DOWN (degraded, WAN's fault) has no remediation and digests.",
+      "check": "checks/templates/check-dns.sh",
+      "params": {
+        "CHECK_KEY": "pihole-dns",
+        "RESOLVER_IP": "192.168.1.2",
+        "TEST_DOMAIN": "example.com",
+        "CASA_RUN": "@RUN@",
+        "CASACTL": "@CASACTL@",
+        "CASA_SVC": "pihole-dns",
+        "CAP_MAX": "99"
+      },
+      "remediations": {
+        "DNS_DOWN": "remediations/casa-restart.sh"
+      },
+      "notify_by_code": { "UPSTREAM_DOWN": "digest" },
+      "_note_upstream": "check-dns emits UPSTREAM_DOWN without severity:degraded, so without this routing a WAN outage would page as a pihole outage - the explicit notify_by_code is the template-sanctioned way to say 'chronic, not actionable here'."
+    },
+    {
+      "name": "truenas-smb",
+      "enabled": true,
+      "_note": "ASK-FIRST class with household consent: PORT_CLOSED proposes a NAS power-cycle and waits for 'heal truenas-smb'; HOST_DOWN is tell-only.",
+      "check": "checks/templates/check-tcp-port.sh",
+      "params": {
+        "CHECK_KEY": "truenas-smb",
+        "TCP_HOST": "127.0.0.1",
+        "TCP_PORT": "18446",
+        "CASA_RUN": "@RUN@",
+        "CASACTL": "@CASACTL@",
+        "CASA_SVC": "truenas-smb",
+        "CAP_MAX": "99"
+      },
+      "remediations": {
+        "PORT_CLOSED": {
+          "ask": "remediations/casa-restart.sh",
+          "arg": "truenas-smb",
+          "consent": "household",
+          "announce": "Heads-up from Cranston: power-cycling the NAS — the photos app will blip for a minute."
+        },
+        "HOST_DOWN": null
+      }
+    },
+    {
+      "name": "truenas-disk",
+      "enabled": true,
+      "_note": "Capacity watch on the scripted tank volume: LOW_SPACE (degraded) digests with a DAILY nag instead of the hourly default.",
+      "check": "checks/templates/check-disk-space.sh",
+      "params": {
+        "CHECK_KEY": "truenas-disk",
+        "MOUNT_PATH": "@RUN@/vol/tank",
+        "MIN_FREE_PCT": "15",
+        "CASA_RUN": "@RUN@"
+      },
+      "remediations": {},
+      "notify_by_code": { "LOW_SPACE": "digest" },
+      "realert_minutes_by_code": { "LOW_SPACE": 1440 }
+    },
+    {
+      "name": "truenas-cert",
+      "enabled": true,
+      "_note": "Expiry countdown on the generated PEM. CERT_EXPIRING is degraded (digest) above CRIT_DAYS and a full page at/below it; one daily nag either way.",
+      "check": "checks/templates/check-cert-expiry.sh",
+      "params": {
+        "CHECK_KEY": "truenas-cert",
+        "CERT_FILE": "@RUN@/certs/truenas.pem",
+        "WARN_DAYS": "21",
+        "CRIT_DAYS": "7",
+        "CASA_RUN": "@RUN@"
+      },
+      "remediations": {},
+      "realert_minutes_by_code": { "CERT_EXPIRING": 1440 }
+    },
+    {
+      "name": "plex",
+      "enabled": true,
+      "_note": "AUTO class with a second transport: primary 18324 + alt 18325 both answer /identity. Primary-only dead = LAN_UNREACHABLE (degraded, digest); both dead with the host pinging = SERVICE_DOWN (auto restart); host dark = HOST_DOWN (tell-only).",
+      "check": "checks/templates/check-http.sh",
+      "params": {
+        "CHECK_KEY": "plex",
+        "HTTP_URL": "http://127.0.0.1:18324/identity",
+        "HTTP_URL_ALT": "http://127.0.0.1:18325/identity",
+        "ALT_GUARD_CMD": "true",
+        "HOST_IP": "192.168.1.4",
+        "CASA_RUN": "@RUN@",
+        "CASACTL": "@CASACTL@",
+        "CASA_SVC": "plex",
+        "CAP_MAX": "99"
+      },
+      "remediations": {
+        "SERVICE_DOWN": "remediations/casa-restart.sh",
+        "HOST_DOWN": null
+      }
+    },
+    {
+      "name": "box-disk",
+      "enabled": true,
+      "local": true,
+      "_note": "LOCAL service: keeps being checked while the router is dark; capacity is scripted healthy unless a scenario fills it.",
+      "check": "checks/templates/check-disk-space.sh",
+      "params": {
+        "CHECK_KEY": "box-disk",
+        "MOUNT_PATH": "@RUN@/vol/root",
+        "MIN_FREE_PCT": "10",
+        "CASA_RUN": "@RUN@"
+      },
+      "remediations": {},
+      "notify_by_code": { "LOW_SPACE": "digest" }
+    }
+  ]
+}

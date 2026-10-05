@@ -1,0 +1,17 @@
+# The real-time cloud drill's scenario: ~75 minutes of wall clock against the
+# casa home with compressed engine defaults (realert 5, hold 2, grace 2,
+# ttl 1h, verify 2, demote 3) and SELFHEAL_SENT_WINDOW_MINUTES=4.
+# Format matches the soak vocabulary ('ev', tag-valued 'expect', free-prose
+# 'note'); 't' is '+MM:SS' from drill start (sim/soak.py parse_t accepts it).
+# sim/cloud/cloud-drill.sh drives it with real sleeps; sim/cloud/collect-run.py
+# rewrites 't' to absolute ISO when it builds the report run dir.
+{"meta": true, "name": "cloud-75min", "gates": "drill"}
+{"t": "+00:00", "ev": "note", "id": "c01-baseline", "note": "baseline: ~10 minutes of silence. The engine cycles every 2 min against a healthy casa; the phone log gains NOTHING but phase 1's 'cranston test page'. Any page here is a gate breach (silent-house invariant)."}
+{"t": "+10:00", "ev": "svc_down", "svc": "plex", "id": "c02-plex-down", "expect": "page", "within_min": 10, "note": "AUTO class. fail_threshold 2 at a */2 cadence confirms by ~+14; the fix runs, verify_delay 2s re-check passes, and chat 1001 gets the relief page within ~5 min of confirmation: 'plex is back - I ran <script> and re-checked: healthy again'. No 'is down' page for plex at any point."}
+{"t": "+20:00", "ev": "svc_down", "svc": "truenas-smb", "id": "c03-nas-down", "expect": "page", "within_min": 10, "note": "ASK-FIRST class. By ~+24 chat 1001 gets ONE page carrying both the approval prompt \"Reply 'heal truenas-smb' to approve.\" and the consent scope line 'This affects the household'. The engine must NOT restart it on its own."}
+{"t": "+26:00", "ev": "note", "id": "c04-nas-renewals", "note": "left unattended: realert 5 re-pages the same ask every ~5-6 min (~+30, ~+36). SENT_WINDOW=4 < realert 5 so identical renewals still deliver. After ask_demote_after=3 immediate pages, re-page 4+ routes to the digest: expect 2-3 immediate truenas-smb pages total and none after ~+45. The pending approval renews throughout."}
+{"t": "+50:00", "ev": "admin_heal", "key": "truenas-smb", "id": "c05-admin-heal", "expect": "announce", "within_min": 8, "note": "the admin approves. approve-heal queues the household announce (chat 2001, bare text, no header) BEFORE the fix, runs it through the gateless path, verifies. The post-heal all-clear may land as a page or in the digest (the key was demoted) - either is correct."}
+{"t": "+57:00", "ev": "gw_down", "ip": "192.168.1.1", "dur_min": 6, "id": "c06-gw-blip", "expect": "silent", "note": "router dark 6 min + grace 2: the network gate skips every non-local service; zero messages in or just after the window. dur_min feeds G3's silence span; the driver does not expand it, so the explicit gw_up below does the replug."}
+{"t": "+63:00", "ev": "gw_up", "ip": "192.168.1.1", "id": "c07-gw-up"}
+{"t": "+66:00", "ev": "disk_fill", "vol": "tank", "pct": 90, "id": "c08-disk-fill", "expect": "digest", "note": "LOW_SPACE degraded -> digest line; the */15 digest cron flushes it as '⚠️ Daily catch-up' within ~16 min (the drill waits past scenario end for it)."}
+{"t": "+75:00", "ev": "end", "id": "c09-end"}

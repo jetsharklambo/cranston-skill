@@ -1,0 +1,21 @@
+{
+  "_note": "The simulated family home that sim/casa/casa-ctl drives. IPs are ping-shim identities (sandbox/lan/ping answers iff $SANDBOX_RUN/lan/hosts/<ip> exists); real listeners all live on 127.0.0.1 loopback ports so nothing ever touches a real LAN. truenas's ping identity is 127.0.0.1 because check-tcp-port pings the SAME address it connects to (TCP_HOST) - connecting to a literal 192.168.1.x could reach a real device on the developer's LAN. Port 18446 (not the sandbox's 18445): sandbox/.run's own nas listener may be alive on the same machine, and sharing its port made a stopped casa NAS look healthy.",
+  "hosts": {
+    "router":    {"ip": "192.168.1.1", "ping_ip": "192.168.1.1", "services": []},
+    "pihole-pi": {"ip": "192.168.1.2", "ping_ip": "192.168.1.2", "services": ["pihole-dns"]},
+    "truenas":   {"ip": "192.168.1.3", "ping_ip": "127.0.0.1",   "services": ["truenas-smb"]},
+    "plex-mini": {"ip": "192.168.1.4", "ping_ip": "192.168.1.4", "services": ["plex"]}
+  },
+  "services": {
+    "pihole-dns":   {"kind": "dns", "resolver_ip": "192.168.1.2"},
+    "truenas-smb":  {"kind": "tcp", "port": 18446},
+    "plex":         {"kind": "group", "members": ["plex-primary", "plex-alt"]},
+    "plex-primary": {"kind": "http", "port": 18324, "path": "/identity"},
+    "plex-alt":     {"kind": "http", "port": 18325, "path": "/identity"}
+  },
+  "dns_targets": {
+    "resolver":  "192.168.1.2",
+    "upstream1": "1.1.1.1",
+    "upstream2": "8.8.8.8"
+  }
+}

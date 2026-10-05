@@ -1,0 +1,21 @@
+#!/bin/bash
+# dig PATH stub for the casa sim. checks/templates/check-dns.sh invokes
+#   dig +time=2 +tries=2 @<server> <domain> A +short
+# and greps stdout for an IPv4 line. This stub answers from the mode file
+# $CASA_RUN/dns/<server-ip>: "up" prints one A record; anything else (down,
+# wedged, or a missing file) prints dig's communications-error line to STDOUT
+# - exactly where real dig prints it, the trap check-dns's header documents.
+# Pure bash so a 2-minute cron soak stays fast.
+server=""
+for a in "$@"; do case "$a" in @*) server="${a#@}" ;; esac; done
+if [ -z "$server" ] || [ -z "${CASA_RUN:-}" ]; then
+    echo ";; dig stub: no @server or CASA_RUN unset"
+    exit 9
+fi
+mode=$(cat "$CASA_RUN/dns/$server" 2>/dev/null || echo down)
+if [ "$mode" = up ]; then
+    echo "93.184.216.34"
+else
+    echo ";; communications error to ${server}#53: timed out"
+    exit 9
+fi

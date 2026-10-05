@@ -31,6 +31,7 @@ and platform facts: `docs/dual-skill-spec.md`; the system blueprint:
 | `authoring/scripts/onboard/` | Per-device interview (`interview.py` + `catalog.json`): fills gaps in a hand-written `services.json`, provenance-tracked, manual config always wins. |
 | `authoring/references/` | The onboarding methodology (discovery/interview/failure-modes/doctrine), schema contract, approval-gates guide, worked example, hardware guide. |
 | `sandbox/` | Local fake-LAN drills (`up.sh`/`drill.sh`/`interview-drill.sh`); excluded from the package. |
+| `sim/` | Home-simulation suite (excluded from the package): `casa/` fake family home (pihole/truenas/plex, dig+df PATH stubs, two-chat stub Bot API in `phone/`), `scenarios/` (authored 90-day timeline + seeded generator), `soak.py` (compressed-clock driver: patched engine clock + real delivery chain under `SELFHEAL_NOW`), `report.py` (hard gates G1–G10 on frequency/routing/dedupe), `judge/` (advisory Claude tone rubric), `cloud/` + `CLOUD-TEST.md` (real-time drill runbook for a Claude cloud session: install, interview-as-persona, 75-min traffic). |
 | `tools/` | `build.py` (deterministic dual-view build), `check_drift.py`, `validate_links.py`. |
 | `tests/` | See workflow below. Harness patterns: `test_engine.py` imports the engine with a fake clock (`sh.now`) and `verify_delay_seconds: 0`, runs approve-heal as a subprocess; `test_delivery.sh`/`test_install.sh` use a recording `$STUB` sender / PATH-stubbed `crontab` and an `assert <name> <rc> <substr> -- env... cmd` helper; `test_templates.sh` stubs binaries on PATH. All suites run against `authoring/` directly — no build needed to test. |
 
@@ -51,6 +52,9 @@ and platform facts: `docs/dual-skill-spec.md`; the system blueprint:
    python3 tests/test_methodology.py && python3 tests/test_interview.py &&
    bash tests/test_templates.sh && bash tests/test_delivery.sh &&
    bash tests/test_install.sh`
+   For engine/delivery/message changes also run the simulation soak:
+   `python3 sim/soak.py --scenario sim/scenarios/family-home-90d.jsonl --out sim/.run/out
+    && python3 sim/report.py --run sim/.run/out --scenario sim/scenarios/family-home-90d.jsonl`
 7. CI additionally greps the generated views for secrets, absolute home
    paths, and real tailnet IPs — don't introduce any.
 8. Report changed behavior, generated artifacts, test results, and any

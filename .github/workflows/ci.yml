@@ -52,6 +52,15 @@ jobs:
       - name: Installer suite (offline)
         run: bash tests/test_install.sh
 
+      # 90 simulated days of home traffic against the real engine + delivery
+      # chain, then the frequency/quality gates; plus one seeded variant.
+      - name: Home-simulation soak + gates (offline)
+        run: |
+          python3 sim/soak.py --scenario sim/scenarios/family-home-90d.jsonl --out sim/.run/out
+          python3 sim/report.py --run sim/.run/out --scenario sim/scenarios/family-home-90d.jsonl
+          python3 sim/soak.py --gen-seed 42 --days 45 --out sim/.run/out-seed42
+          python3 sim/report.py --run sim/.run/out-seed42
+
       # Generic example-LAN addresses (192.168.1.x) are allowed by design; this
       # hunts real identifiers: secrets, home paths, non-doc-range tailnet IPs.
       - name: No secrets, personal paths, or real tailnet IPs in the views

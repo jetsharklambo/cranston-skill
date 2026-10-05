@@ -1,0 +1,170 @@
+#!/bin/bash
+# casa-ctl - control the simulated family home (table-driven from casa.json).
+#
+#   casa-ctl start|stop|status <svc>     services from casa.json "services"
+#                                        (dns kind = mode file; http/tcp kind =
+#                                        pid file + fake-service.py; group =
+#                                        all members)
+#   casa-ctl plug|unplug <ip>            a HOST by its casa.json ip: touches /
+#                                        removes the ping-shim marker for its
+#                                        ping_ip AND starts / stops the
+#                                        services hosted on it
+#   casa-ctl dns-mode <tgt> <mode>       tgt: resolver|upstream1|upstream2|all
+#                                        mode: up|down|wedged (wedged: the dig
+#                                        stub fails but `casa-ctl start
+#                                        pihole-dns` "succeeds" without fixing
+#                                        it - the restart-is-ineffective case)
+#   casa-ctl disk-fill <vol> <pct>       script $CASA_RUN/vol/<vol>'s df
+#                                        Capacity% in disk-table.json
+#   casa-ctl cert-set <name> <days>      regenerate $CASA_RUN/certs/<name>.pem
+#                                        valid for <days> (real-clock openssl;
+#                                        see sim/README.md on cert time)
+#   casa-ctl tg-mode <ok|500>            flip the stub Bot API's mode file
+#   casa-ctl ls                          everything at a glance
+#
+# Env: CASA_RUN required (the run dir sim/casa/up-casa.sh built).
+# Start/stop semantics for the dns kind: "stop" writes mode=down; "start"
+# writes mode=up UNLESS the current mode is "wedged", in which case it exits 0
+# and leaves it wedged (the restart ran, the resolver is still dead). "status"
+# reports running for up AND wedged (the process is up; it just doesn't work).
+set -u
+RUN="${CASA_RUN:?CASA_RUN not set - source the run dir env.sh}"
+CFG="$RUN/casa.json"
+HOSTS="$RUN/lan/hosts"
+PIDS="$RUN/lan/pids"
+mkdir -p "$HOSTS" "$PIDS" "$RUN/dns" "$RUN/certs"
+
+# svc_spec <name> -> one line per concrete unit:
+#   dns <resolver_ip>   |   listener <name> <kind> <port> <path>
+svc_spec() {
+    python3 - "$CFG" "$1" <<'PY'
+import json, sys
+cfg, name = json.load(open(sys.argv[1])), sys.argv[2]
+svcs = cfg["services"]
+if name not in svcs:
+    raise SystemExit(64)
+def emit(n):
+    s = svcs[n]
+    if s["kind"] == "dns":
+        print("dns", s["resolver_ip"])
+    elif s["kind"] == "group":
+        for m in s["members"]:
+            emit(m)
+    else:
+        print("listener", n, s["kind"], s["port"], s.get("path", "/ping"))
+emit(name)
+PY
+}
+
+dns_ips() {  # <resolver|upstream1|upstream2|all> -> space-separated ips
+    python3 - "$CFG" "$1" <<'PY'
+import json, sys
+cfg, tgt = json.load(open(sys.argv[1])), sys.argv[2]
+t = cfg["dns_targets"]
+if tgt == "all":
+    print(" ".join(t.values()))
+elif tgt in t:
+    print(t[tgt])
+else:
+    raise SystemExit(64)
+PY
+}
+
+host_lookup() {  # <ip> -> "ping_ip svc1 svc2..."
+    python3 - "$CFG" "$1" <<'PY'
+import json, sys
+cfg, ip = json.load(open(sys.argv[1])), sys.argv[2]
+for h in cfg["hosts"].values():
+    if h["ip"] == ip:
+        print(h["ping_ip"], *h["services"])
+        raise SystemExit(0)
+raise SystemExit(64)
+PY
+}
+
+running() { local p="$PIDS/$1.pid"; [ -f "$p" ] && kill -0 "$(cat "$p")" 2>/dev/null; }
+
+start_listener() {  # <name> <kind> <port> <path>
+    running "$1" && return 0
+    nohup python3 "$RUN/lan/fake-service.py" "$2" "$3" "$4" >/dev/null 2>&1 &
+    echo $! > "$PIDS/$1.pid"
+    for _ in 1 2 3 4 5 6 7 8 9 10; do
+        python3 -c "import socket; socket.create_connection(('127.0.0.1',$3),1)" 2>/dev/null && return 0
+        sleep 0.2
+    done
+    echo "start $1: port $3 never opened" >&2; return 1
+}
+
+stop_listener() {
+    running "$1" && kill "$(cat "$PIDS/$1.pid")" 2>/dev/null
+    rm -f "$PIDS/$1.pid"; sleep 0.1
+}
+
+each_unit() {  # <verb> <svc> ; verb in start|stop|status; aggregates rc
+    local verb="$1" svc="$2" rc=0 spec
+    spec=$(svc_spec "$svc") || { echo "unknown service: $svc" >&2; return 64; }
+    while read -r kind a b c d; do
+        case "$kind" in
+            dns)
+                local f="$RUN/dns/$a" mode
+                mode=$(cat "$f" 2>/dev/null || echo down)
+                case "$verb" in
+                    start)  [ "$mode" = wedged ] || echo up > "$f" ;;
+                    stop)   echo down > "$f" ;;
+                    status) [ "$mode" != down ] || rc=1 ;;
+                esac ;;
+            listener)
+                case "$verb" in
+                    start)  start_listener "$a" "$b" "$c" "$d" || rc=1 ;;
+                    stop)   stop_listener "$a" ;;
+                    status) running "$a" || rc=1 ;;
+                esac ;;
+        esac
+    done <<< "$spec"
+    return $rc
+}
+
+case "${1:-ls}" in
+    start|stop)  each_unit "$1" "$2" ;;
+    status)      if each_unit status "$2"; then echo "$2: running"; else echo "$2: stopped"; exit 1; fi ;;
+    plug|unplug)
+        set -- "$1" "$2"
+        read -r ping_ip svcs <<< "$(host_lookup "$2")" || { echo "unknown host ip: $2" >&2; exit 64; }
+        if [ "$1" = plug ]; then
+            touch "$HOSTS/$ping_ip"
+            for s in $svcs; do each_unit start "$s"; done
+        else
+            rm -f "$HOSTS/$ping_ip"
+            for s in $svcs; do each_unit stop "$s"; done
+        fi ;;
+    dns-mode)
+        tgt="$2"; mode="$3"
+        case "$mode" in up|down|wedged) ;; *) echo "dns-mode: mode must be up|down|wedged" >&2; exit 64 ;; esac
+        ips=$(dns_ips "$tgt") || { echo "dns-mode: target must be resolver|upstream1|upstream2|all" >&2; exit 64; }
+        for ip in $ips; do echo "$mode" > "$RUN/dns/$ip"; done ;;
+    disk-fill)
+        vol="$2"; pct="$3"
+        python3 - "$RUN/disk-table.json" "$RUN/vol/$vol" "$pct" <<'PY'
+import json, sys
+path, mount, pct = sys.argv[1], sys.argv[2], int(sys.argv[3])
+try:
+    t = json.load(open(path))
+except Exception:
+    t = {}
+t[mount] = pct
+json.dump(t, open(path, "w"))
+PY
+        ;;
+    cert-set)   bash "$RUN/bin/make-cert.sh" "$2" "$3" ;;
+    tg-mode)
+        if [ "$2" = ok ] || [ "$2" = 500 ]; then echo "$2" > "$RUN/tg-mode"
+        else echo "tg-mode: ok|500" >&2; exit 64; fi ;;
+    ls)
+        echo "hosts (plugged):"; for h in "$HOSTS"/*; do [ -e "$h" ] && echo "  $(basename "$h")"; done
+        echo "dns modes:"; for f in "$RUN"/dns/*; do [ -e "$f" ] && echo "  $(basename "$f"): $(cat "$f")"; done
+        echo "listeners:"; for p in "$PIDS"/*.pid; do [ -e "$p" ] || continue
+            n=$(basename "$p" .pid); running "$n" && echo "  $n: running" || echo "  $n: dead pidfile"; done
+        echo "disk table: $(cat "$RUN/disk-table.json" 2>/dev/null || echo "{}")"
+        echo "tg mode: $(cat "$RUN/tg-mode" 2>/dev/null || echo ok)" ;;
+    *) sed -n '3,25p' "$0"; exit 64 ;;
+esac
